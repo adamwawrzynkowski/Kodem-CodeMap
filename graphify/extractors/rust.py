@@ -441,6 +441,33 @@ def _rust_has_test_attribute(item, source: bytes) -> bool:
     return False
 
 
+def _rust_macro_calls(tree, source: bytes):
+    """Yields `(token, name, path)` for each `f(...)` and `a::b::f(...)` in a macro's token
+    tree and the trees nested in it (Modified by Kodem). `path` holds the qualifier segments,
+    empty for a bare name. A method call `x.f(...)`, a nested macro `f!(...)` and the name
+    after `fn` are not calls of a free function, so they are left out."""
+    kids = tree.children
+    for index, kid in enumerate(kids):
+        if kid.type == "token_tree":
+            yield from _rust_macro_calls(kid, source)
+            continue
+        if kid.type != "identifier" or index + 1 >= len(kids):
+            continue
+        follower = kids[index + 1]
+        if follower.type != "token_tree" or not source[follower.start_byte:follower.end_byte].startswith(b"("):
+            continue
+        path: list[str] = []
+        before = index - 1
+        while before >= 1 and kids[before].type == "::" and kids[before - 1].type in (
+            "identifier", "crate", "self", "super",
+        ):
+            path.insert(0, _read_text(kids[before - 1], source))
+            before -= 2
+        if before >= 0 and kids[before].type in (".", "fn", "!", "::"):
+            continue
+        yield kid, _read_text(kid, source), path
+
+
 def _rust_scope(node):
     """The module a node sits in: its nearest `mod` item, else the file root."""
     while node is not None:
@@ -1538,6 +1565,134 @@ def extract_rust(path: Path) -> dict:
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
 
+    def bind_call(
+        node,
+        caller_nid: str,
+        self_type: str | None,
+        self_impl_key: str | None,
+        mods: tuple[str, ...],
+        callee_name: str | None,
+        is_member_call: bool,
+        is_scoped_call: bool,
+        is_self_call: bool,
+        qualifier_type: str | None,
+        scoped_path: list[str] | None,
+        receiver_desc: dict | None,
+    ) -> None:
+        """Binds one call at `node` in this file, or hands it to the corpus pass. Shared by
+        `call_expression` and by the calls in a macro's token tree (Modified by Kodem)."""
+        # The shared `_LANGUAGE_BUILTIN_GLOBALS` holds Python/JS/Swift names
+        # (`len`, `map`, `set`), not Rust ones: a Rust fn or method of that
+        # name is an ordinary call (#2313). Only Rust's own prelude types
+        # (`Some(x)`, `Ok(x)`) are dropped, unless the file shadows them.
+        if (
+            callee_name
+            and (callee_name not in _RUST_BUILTIN_TYPES or callee_name in local_types)
+        ):
+            if qualifier_type is not None or (is_self_call and self_type):
+                # `Type::f()` / `Self::f()` / `self.f()` name the type whose
+                # method is called: bind only to that type's method in this
+                # file. Matching the bare name instead sent `Arc::new(x)` and
+                # `B::new()` to whichever `fn new` the file happened to define.
+                owner = _rust_type_last_segment(qualifier_type or self_type or "")
+                tgt_nid = lookup_method(owner, callee_name, mods)
+                if tgt_nid is None and qualifier_type is not None:
+                    # `Enum::Variant(x)` constructs a value: the variant node.
+                    named = lookup_item(callee_name, mods)
+                    tgt_nid = named if named in type_nids else None
+            elif is_scoped_call:
+                # `util::f()` / `crate::f()` names a module, which is another
+                # file unless the path is `self::` or an inline `mod` here:
+                # the bare name `f` in this file is the wrong function.
+                tgt_nid = None
+                if scoped_path and _rust_in_file_module_path(scoped_path, node, inline_mod_names):
+                    if scoped_path == ["self"]:
+                        target_mods = mods
+                    elif scoped_path == ["super"]:
+                        target_mods = mods[:-1]
+                    elif mods + tuple(scoped_path) in mod_paths_in_file:
+                        target_mods = mods + tuple(scoped_path)
+                    else:
+                        target_mods = tuple(scoped_path)
+                    tgt_nid = lookup_item(callee_name, target_mods, exact=True)
+            elif is_member_call and not is_self_call:
+                # `x.m()` binds by the receiver's type in the corpus pass, or
+                # not at all: by bare name it reached whichever `m` the file
+                # defined, which was wrong for most receivers the type pass
+                # cannot type (std and dependency types, untyped closures).
+                tgt_nid = None
+            elif is_member_call:
+                # `self.m()` in a trait's default method (no impl type): the
+                # trait's own methods are the ones in this file.
+                tgt_nid = method_label_to_nid.get(callee_name)
+            else:
+                tgt_nid = lookup_item(callee_name, mods)
+            if tgt_nid and tgt_nid != caller_nid:
+                pair = (caller_nid, tgt_nid)
+                if pair not in seen_call_pairs:
+                    seen_call_pairs.add(pair)
+                    line = node.start_point[0] + 1
+                    is_constructor = tgt_nid in type_nids
+                    edges.append({
+                        "source": caller_nid,
+                        "target": tgt_nid,
+                        "relation": "references" if is_constructor else "calls",
+                        "context": "constructor" if is_constructor else "call",
+                        "confidence": "EXTRACTED",
+                        "source_file": str_path,
+                        "source_location": f"L{line}",
+                        "weight": 1.0,
+                    })
+            elif receiver_desc is not None:
+                # Typed: the type evidence makes even a common name like
+                # `build` or `new` safe, so the blocklist does not apply.
+                raw_calls.append({
+                    "caller_nid": caller_nid,
+                    "callee": callee_name,
+                    "is_member_call": True,
+                    "rust_receiver": receiver_desc,
+                    "source_file": str_path,
+                    "source_location": f"L{node.start_point[0] + 1}",
+                })
+            elif is_scoped_call:
+                if scoped_path and _rust_scoped_path_may_be_local(scoped_path, qualifier_type, local_types):
+                    raw_calls.append({
+                        "caller_nid": caller_nid,
+                        "callee": callee_name,
+                        "is_member_call": False,
+                        "rust_path": scoped_path,
+                        "rust_type_call": qualifier_type is not None,
+                        "source_file": str_path,
+                        "source_location": f"L{node.start_point[0] + 1}",
+                    })
+            elif (
+                not is_member_call
+                or is_self_call
+                or callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST
+            ):
+                # The blocklist guards only an untyped `x.m()`: a bare `len()`
+                # names a free fn, and `self.run()` is typed by its impl.
+                rc_entry = {
+                    "caller_nid": caller_nid,
+                    "callee": callee_name,
+                    "is_member_call": is_member_call,
+                    "source_file": str_path,
+                    "source_location": f"L{node.start_point[0] + 1}",
+                }
+                if is_self_call and self_type:
+                    rc_entry["rust_self_type"] = self_type
+                    if self_impl_key:
+                        rc_entry["rust_self_impl_key"] = self_impl_key
+                if not is_member_call:
+                    # `use crate::theme::px; px(1.)`: the path the name was
+                    # imported by, so a name defined in two crates binds to
+                    # the imported one.
+                    scope = _rust_scope(node)
+                    bound = _rust_use_paths(scope, source).get(callee_name) if scope is not None else None
+                    if bound:
+                        rc_entry["rust_use_path"] = bound
+                raw_calls.append(rc_entry)
+
     def walk_calls(
         node,
         caller_nid: str,
@@ -1576,6 +1731,32 @@ def extract_rust(path: Path) -> dict:
             # returning, preserving the prior traversal of the invocation's
             # subtree (its arguments are a raw token tree, so this neither adds
             # nor drops any nested edges relative to before).
+            # Modified by Kodem: tree-sitter keeps a macro's arguments as a raw token
+            # tree, so `json!({"a": helper(x)})` and `format!("{}", m::f())` hid
+            # their calls. The token tree's `f(...)` and `path::f(...)` bind like
+            # call expressions; `x.m(...)` has no receiver type here and stays out.
+            for tree in node.children:
+                if tree.type != "token_tree":
+                    continue
+                for anchor, name, path in _rust_macro_calls(tree, source):
+                    if not path:
+                        bind_call(anchor, caller_nid, self_type, self_impl_key, mods, name,
+                                  False, False, False, None, None, None)
+                        continue
+                    last = path[-1]
+                    if last == "Self":
+                        qualifier = self_type or ""
+                        macro_path = [qualifier] if qualifier else None
+                    else:
+                        qualifier = last if last[:1].isupper() or last in _RUST_PRIMITIVE_TYPES else None
+                        macro_path = list(path)
+                        if macro_path[0] not in ("crate", "self", "super", "::"):
+                            scope = _rust_scope(anchor)
+                            bound = _rust_use_paths(scope, source).get(macro_path[0]) if scope is not None else None
+                            if bound:
+                                macro_path = bound + macro_path[1:]
+                    bind_call(anchor, caller_nid, self_type, self_impl_key, mods, name,
+                              False, True, False, qualifier, macro_path, None)
         if node.type == "call_expression":
             func_node = node.child_by_field_name("function")
             callee_name: str | None = None
@@ -1625,117 +1806,10 @@ def extract_rust(path: Path) -> dict:
                             bound = _rust_use_paths(scope, source).get(scoped_path[0]) if scope is not None else None
                             if bound:
                                 scoped_path = bound + scoped_path[1:]
-            # The shared `_LANGUAGE_BUILTIN_GLOBALS` holds Python/JS/Swift names
-            # (`len`, `map`, `set`), not Rust ones: a Rust fn or method of that
-            # name is an ordinary call (#2313). Only Rust's own prelude types
-            # (`Some(x)`, `Ok(x)`) are dropped, unless the file shadows them.
-            if (
-                callee_name
-                and (callee_name not in _RUST_BUILTIN_TYPES or callee_name in local_types)
-            ):
-                if qualifier_type is not None or (is_self_call and self_type):
-                    # `Type::f()` / `Self::f()` / `self.f()` name the type whose
-                    # method is called: bind only to that type's method in this
-                    # file. Matching the bare name instead sent `Arc::new(x)` and
-                    # `B::new()` to whichever `fn new` the file happened to define.
-                    owner = _rust_type_last_segment(qualifier_type or self_type or "")
-                    tgt_nid = lookup_method(owner, callee_name, mods)
-                    if tgt_nid is None and qualifier_type is not None:
-                        # `Enum::Variant(x)` constructs a value: the variant node.
-                        named = lookup_item(callee_name, mods)
-                        tgt_nid = named if named in type_nids else None
-                elif is_scoped_call:
-                    # `util::f()` / `crate::f()` names a module, which is another
-                    # file unless the path is `self::` or an inline `mod` here:
-                    # the bare name `f` in this file is the wrong function.
-                    tgt_nid = None
-                    if scoped_path and _rust_in_file_module_path(scoped_path, node, inline_mod_names):
-                        if scoped_path == ["self"]:
-                            target_mods = mods
-                        elif scoped_path == ["super"]:
-                            target_mods = mods[:-1]
-                        elif mods + tuple(scoped_path) in mod_paths_in_file:
-                            target_mods = mods + tuple(scoped_path)
-                        else:
-                            target_mods = tuple(scoped_path)
-                        tgt_nid = lookup_item(callee_name, target_mods, exact=True)
-                elif is_member_call and not is_self_call:
-                    # `x.m()` binds by the receiver's type in the corpus pass, or
-                    # not at all: by bare name it reached whichever `m` the file
-                    # defined, which was wrong for most receivers the type pass
-                    # cannot type (std and dependency types, untyped closures).
-                    tgt_nid = None
-                elif is_member_call:
-                    # `self.m()` in a trait's default method (no impl type): the
-                    # trait's own methods are the ones in this file.
-                    tgt_nid = method_label_to_nid.get(callee_name)
-                else:
-                    tgt_nid = lookup_item(callee_name, mods)
-                if tgt_nid and tgt_nid != caller_nid:
-                    pair = (caller_nid, tgt_nid)
-                    if pair not in seen_call_pairs:
-                        seen_call_pairs.add(pair)
-                        line = node.start_point[0] + 1
-                        is_constructor = tgt_nid in type_nids
-                        edges.append({
-                            "source": caller_nid,
-                            "target": tgt_nid,
-                            "relation": "references" if is_constructor else "calls",
-                            "context": "constructor" if is_constructor else "call",
-                            "confidence": "EXTRACTED",
-                            "source_file": str_path,
-                            "source_location": f"L{line}",
-                            "weight": 1.0,
-                        })
-                elif receiver_desc is not None:
-                    # Typed: the type evidence makes even a common name like
-                    # `build` or `new` safe, so the blocklist does not apply.
-                    raw_calls.append({
-                        "caller_nid": caller_nid,
-                        "callee": callee_name,
-                        "is_member_call": True,
-                        "rust_receiver": receiver_desc,
-                        "source_file": str_path,
-                        "source_location": f"L{node.start_point[0] + 1}",
-                    })
-                elif is_scoped_call:
-                    if scoped_path and _rust_scoped_path_may_be_local(scoped_path, qualifier_type, local_types):
-                        raw_calls.append({
-                            "caller_nid": caller_nid,
-                            "callee": callee_name,
-                            "is_member_call": False,
-                            "rust_path": scoped_path,
-                            "rust_type_call": qualifier_type is not None,
-                            "source_file": str_path,
-                            "source_location": f"L{node.start_point[0] + 1}",
-                        })
-                elif (
-                    not is_member_call
-                    or is_self_call
-                    or callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST
-                ):
-                    # The blocklist guards only an untyped `x.m()`: a bare `len()`
-                    # names a free fn, and `self.run()` is typed by its impl.
-                    rc_entry = {
-                        "caller_nid": caller_nid,
-                        "callee": callee_name,
-                        "is_member_call": is_member_call,
-                        "source_file": str_path,
-                        "source_location": f"L{node.start_point[0] + 1}",
-                    }
-                    if is_self_call and self_type:
-                        rc_entry["rust_self_type"] = self_type
-                        if self_impl_key:
-                            rc_entry["rust_self_impl_key"] = self_impl_key
-                    if not is_member_call:
-                        # `use crate::theme::px; px(1.)`: the path the name was
-                        # imported by, so a name defined in two crates binds to
-                        # the imported one.
-                        scope = _rust_scope(node)
-                        bound = _rust_use_paths(scope, source).get(callee_name) if scope is not None else None
-                        if bound:
-                            rc_entry["rust_use_path"] = bound
-                    raw_calls.append(rc_entry)
+            bind_call(
+                node, caller_nid, self_type, self_impl_key, mods, callee_name, is_member_call,
+                is_scoped_call, is_self_call, qualifier_type, scoped_path, receiver_desc,
+            )
         for child in node.children:
             walk_calls(child, caller_nid, self_type, self_impl_key, typer, mods)
 

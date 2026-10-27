@@ -159,6 +159,30 @@ def test_the_activity_path_must_be_absolute(graph: Path) -> None:
     assert process.returncode == kodem_main.EXIT_USAGE
 
 
+def test_the_tools_ask_claude_code_to_load_them_up_front(graph: Path) -> None:
+    _, tools, _ = asyncio.run(_session_calls(graph, []))
+    assert all((tool.meta or {}).get("anthropic/alwaysLoad") is True for tool in tools)
+
+
+def test_an_ambiguous_name_answers_for_each_place(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "a").mkdir(parents=True)
+    (repo / "b").mkdir(parents=True)
+    (repo / "a" / "one.py").write_text("def start():\n    return go()\n\ndef go():\n    return 1\n", encoding="utf-8")
+    (repo / "b" / "two.py").write_text("def start():\n    return stop()\n\ndef stop():\n    return 2\n", encoding="utf-8")
+    out = tmp_path / "map"
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("PYTEST")}
+    subprocess.run(
+        [sys.executable, "-m", "graphify.kodem_main", "build", str(repo), "--out", str(out)],
+        check=True, capture_output=True, env=environment, timeout=300,
+    )
+    _, _, texts = asyncio.run(_session_calls(out / "graph.json", [("get_neighbors", {"label": "start"})]))
+    answer = texts[0]
+    assert "a/one.py" in answer and "b/two.py" in answer
+    assert "go()" in answer and "stop()" in answer
+    assert not answer.startswith("Ambiguous")
+
+
 def test_hidden_upstream_tools_cannot_be_called(graph: Path) -> None:
     _, _, texts = asyncio.run(_session_calls(graph, [("list_prs", {}), ("graph_stats", {})]))
     assert texts == ["Unknown tool: list_prs", "Unknown tool: graph_stats"]

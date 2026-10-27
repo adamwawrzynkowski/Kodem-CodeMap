@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 GRAPHIFY_VERSION = "0.9.96"
 SCHEMA = 1
 RESULT_PREFIX = "KODEM-CODEMAP-RESULT "

@@ -26,13 +26,13 @@ from graphify.paths import default_graph_json as _default_graph_json
 KODEM_SERVER_NAME = "kodem-codemap"
 KODEM_TOOL_NAMES = ("query_graph", "get_node", "get_neighbors", "shortest_path")
 KODEM_INSTRUCTIONS = (
-    "Code Map: a graph of this project's code. Ask it before you search files: query_graph "
-    "for a question about the code, get_node and get_neighbors for a symbol, shortest_path "
-    "for how two parts connect. Rely on its answers and read only the lines that it names; "
-    "search files only for what it cannot answer, such as strings or configuration. "
+    "Code Map: a graph of this project's code. Use it for how code connects: get_neighbors "
+    "for what calls or uses a symbol, shortest_path for how two parts connect, query_graph "
+    "for a broader question. Use grep or read for a name, string or file that you know. "
     "In answers, a NODE line without a path is in the file of the NODE line above it."
 )
 _KODEM_DEFAULT_DEPTH = 2
+_KODEM_AMBIGUOUS_ANSWERS = 3
 _KODEM_DEFAULT_BUDGET = 1200
 
 
@@ -121,10 +121,16 @@ def group_by_file(G: nx.Graph, nodes: list[str], seeds: list[str]) -> list[str]:
     return [nid for members in files.values() for nid in members]
 
 
+# Claude Code loads a tool with this flag with the session instead of behind its tool
+# search, which cost every session that used the map one more turn. The four tools take
+# about 400 tokens; other agents ignore the flag.
+_KODEM_TOOL_META = {"anthropic/alwaysLoad": True}
+
+
 def kodem_tools(types) -> list:
     """Returns the four tool definitions of Kodem's Code Map server."""
     label = {"type": "string", "description": "Symbol name or node ID"}
-    return [
+    tools = [
         types.Tool(
             name="query_graph",
             description="Find the code related to a question and how it connects.",
@@ -165,6 +171,9 @@ def kodem_tools(types) -> list:
             },
         ),
     ]
+    for tool in tools:
+        tool.meta = dict(_KODEM_TOOL_META)
+    return tools
 
 try:
     with warnings.catch_warnings():
@@ -2710,10 +2719,26 @@ def _build_server(graph_path: str):
         label = raw.lower()
         rel_filter = arguments.get("relation_filter", "").lower()
         nid, err = _resolve_single_node(G, label)
-        if err:
+        if err and not (kodem_mode() and _is_ambiguity_refusal(err)):
             return err
-        lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
-        lines.extend(_neighbor_lines(G, nid, rel_filter))
+        if err:
+            # Kodem: a name in several places answers for each of them, up to three, which
+            # saves the agent the round trip of naming one by its path.
+            source_exact, exact, _prefix, _substring = _find_node_tiers(G, label)
+            candidates = source_exact or exact
+            if not candidates:
+                return err
+            lines = []
+            for candidate in candidates[:_KODEM_AMBIGUOUS_ANSWERS]:
+                place = sanitize_label(str(G.nodes[candidate].get("source_file", "")))
+                lines.append(f"Neighbors of {sanitize_label(G.nodes[candidate].get('label', candidate))} in {place}:")
+                lines.extend(_neighbor_lines(G, candidate, rel_filter))
+            if len(candidates) > _KODEM_AMBIGUOUS_ANSWERS:
+                rest = len(candidates) - _KODEM_AMBIGUOUS_ANSWERS
+                lines.append(f"{rest} more nodes share this name; name one as path::symbol.")
+        else:
+            lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
+            lines.extend(_neighbor_lines(G, nid, rel_filter))
         budget = int(arguments.get("token_budget", default_budget()))
         return _cut_lines_to_budget(
             lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
