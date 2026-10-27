@@ -90,7 +90,7 @@ from graphify.extractors.verilog import extract_verilog  # noqa: F401
 from graphify.extractors.vbnet import extract_vbnet, resolve_vbnet_partial_calls  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
-from graphify.paths import disambiguate_ambiguous_candidates
+from graphify.paths import _is_test_path, disambiguate_ambiguous_candidates
 
 from graphify.extractors.models import LanguageConfig, _JS_CACHE_BYPASS_SUFFIXES, _NamespaceExportFact, _StarExportFact, _SymbolAliasFact, _SymbolDeclarationFact, _SymbolExportFact, _SymbolImportFact, _SymbolResolutionFacts, _SymbolUseFact, _WORKSPACE_PACKAGE_CACHE  # noqa: E402,F401
 
@@ -7673,14 +7673,44 @@ class _RustCorpusIndex:
         decl = self.pick(self.declared_by_type.get(name, []), from_file)
         return (name, self.file(decl)) if decl else None
 
-    def method(self, owner: tuple[str, str], name: str) -> str | None:
-        """The one method ``name`` across the impl blocks of ``owner`` in its crate."""
+    def method(self, owner: tuple[str, str], name: str, caller: str | None = None) -> str | None:
+        """The one method ``name`` across the impl blocks of ``owner`` in its
+        crate; with ``caller``, only among the methods ``caller`` may call."""
         type_name, decl_file = owner
         found: set[str] = set()
         for nid in self.owners_by_type.get(type_name, []):
             if self.same_crate(self.file(nid), decl_file):
                 found |= self.methods_by_owner.get((nid, name), set())
+        if caller is not None:
+            found = {m for m in found if self.callable_from(m, caller)}
         return next(iter(found)) if len(found) == 1 else None
+
+    def test_only(self, nid: str) -> bool:
+        """Whether node ``nid`` is test code: under `#[cfg(test)]` / `#[test]`,
+        or in a test file."""
+        return bool(self.node_by_id.get(nid, {}).get("_rust_cfg_test")) or _is_test_path(self.file(nid))
+
+    def callable_from(self, target: str, caller: str) -> bool:
+        """Whether Rust lets ``caller`` reach ``target``, by the target's
+        visibility (`_rust_vis`) and test scope: a private item is visible in
+        its module and the modules below it, `pub(super)` one level up,
+        `pub(crate)` / `pub(in ..)` in its crate; test-only code is never the
+        target of a call from production code. A node without the facts (an
+        older graph) passes."""
+        if self.test_only(target) and not self.test_only(caller):
+            return False
+        vis = self.node_by_id.get(target, {}).get("_rust_vis")
+        if not vis or vis == "pub":
+            return True
+        target_file, caller_file = self.file(target), self.file(caller)
+        if not caller_file or not self.same_crate(target_file, caller_file):
+            return False
+        if vis.startswith(("pub(crate)", "pub(in")):
+            return True
+        scope = self.module_path(target)
+        if vis == "pub(super)":
+            scope = scope[:-1]
+        return self.module_path(caller)[:len(scope)] == scope
 
 
 def _resolve_rust_typed_member_calls(
@@ -7765,7 +7795,7 @@ def _resolve_rust_typed_member_calls(
         caller = rc["caller_nid"]
         source_file = str(rc.get("source_file", ""))
         owner = _eval(rc["rust_receiver"], _file(caller) or source_file.replace("\\", "/"))
-        tgt = _method(owner, rc["callee"]) if owner else None
+        tgt = _method(owner, rc["callee"], caller) if owner else None
         if tgt is None or tgt == caller or (caller, tgt) in existing_pairs:
             continue
         existing_pairs.add((caller, tgt))
@@ -7885,7 +7915,7 @@ def _resolve_rust_scoped_calls(
                     pool = exact or in_crate
                     if len(pool) == 1:
                         owner = (type_name, corpus.file(pool[0]))
-            tgt = corpus.method(owner, callee) if owner else None
+            tgt = corpus.method(owner, callee, caller) if owner else None
             confidence, score = "INFERRED", 0.85
         else:
             where = _target_module(path, caller, caller_file)
@@ -7893,7 +7923,7 @@ def _resolve_rust_scoped_calls(
                 crate_root, module = where
                 found = [
                     n for n in fns_by_module.get((callee, tuple(module)), [])
-                    if corpus.in_crate(corpus.file(n), crate_root)
+                    if corpus.in_crate(corpus.file(n), crate_root) and corpus.callable_from(n, caller)
                 ]
                 tgt = found[0] if len(found) == 1 else None
         if tgt is None or tgt == caller or (caller, tgt) in existing_pairs:
@@ -11252,6 +11282,7 @@ def extract(
     _csharp_method_owner: dict[str, str] | None = None  # method nid -> type nid, built on first use
     _csharp_outer_type: dict[str, str] | None = None  # nested type nid -> outer type label, built on first use
     _csharp_overload_cache: dict = {}  # filled on first use (#4584)
+    _rust_corpus: _RustCorpusIndex | None = None  # built on first Rust call
     for rc in all_raw_calls:
         if rc.get("_ambiguous_python_import"):
             continue
@@ -11315,8 +11346,16 @@ def extract(
             continue
         if is_rust_call:
             # A bare Rust `f()` reaches a free fn or a tuple struct/variant,
-            # never a method (`.f()` nodes).
-            candidates = [c for c in candidates if not nid_to_label.get(c, "").startswith(".")]
+            # never a method (`.f()` nodes), and never an item its visibility or
+            # test scope hides from the caller (#2774: a private `fn string()`
+            # took the `String(..)` calls of other files).
+            if _rust_corpus is None:
+                _rust_corpus = _RustCorpusIndex(resolution_nodes, all_edges, [])
+            candidates = [
+                c for c in candidates
+                if not nid_to_label.get(c, "").startswith(".")
+                and _rust_corpus.callable_from(c, str(rc.get("caller_nid", "")))
+            ]
             if not candidates:
                 continue
         if rc.get("lang") == "csharp" and not rc.get("csharp_new") and len(candidates) > 1:
