@@ -1,3 +1,4 @@
+# Modified by Kodem.
 """engine — moved verbatim from graphify/extract.py."""
 from __future__ import annotations
 
@@ -5981,6 +5982,12 @@ _PHP_LANGUAGE_CONSTRUCTS = frozenset({
     "array", "die", "empty", "eval", "exit", "isset", "list", "unset",
 })
 
+# C#'s builtin call names, used instead of _LANGUAGE_BUILTIN_GLOBALS for C#
+# calls: C# has no global functions, so only `nameof(x)` (an operator that
+# parses as an invocation) is never a call to the corpus. The union's `Set`,
+# `Map`, `Data` and `Color` are ordinary C# method and type names.
+_CSHARP_BUILTIN_CALLS = frozenset({"nameof"})
+
 def _php_get_route_name(closure_node, src: bytes) -> str | None:
     """Walk up the AST to extract grouped routing prefixes (#3409)."""
     prefixes = []
@@ -9722,10 +9729,17 @@ def _extract_generic(
             # reach an edge through a guarded, receiver-typed resolver, never the
             # unguarded bare-name path a real god node would need.
             # A known PHP $this receiver resolves against its owning class's methods.
-            _builtin_member_call = is_member_call and callee_name in _LANGUAGE_BUILTIN_GLOBALS
+            # C# has no global functions, so the JS/Python/Swift names of the
+            # union (`Set`, `Map`, `Data`, `Color`) are ordinary C# methods and
+            # types there; only C#'s own call-shaped operator is gated.
+            _builtin_names = (
+                _CSHARP_BUILTIN_CALLS if config.ts_module == "tree_sitter_c_sharp"
+                else _LANGUAGE_BUILTIN_GLOBALS
+            )
+            _builtin_member_call = is_member_call and callee_name in _builtin_names
             php_builtin_self_call = config.ts_module == "tree_sitter_php" and self_receiver == "this"
             if callee_name and (
-                callee_name not in _LANGUAGE_BUILTIN_GLOBALS or _builtin_member_call
+                callee_name not in _builtin_names or _builtin_member_call
             ):
                 # Python member calls defer to receiver-based resolution unless the
                 # receiver is known to stay in the current class. Falling back to a
