@@ -2349,6 +2349,7 @@ def _rebuild_code(
                             key: metadata[key]
                             for key in (
                                 "ruby_resolution_schema",
+                                "csharp_member",
                                 "ruby_method_kind",
                                 "ruby_lookup_unsafe",
                                 "python_opaque_bases",

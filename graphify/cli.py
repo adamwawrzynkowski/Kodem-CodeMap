@@ -4395,6 +4395,7 @@ def dispatch_command(cmd: str) -> None:
                                 key: _metadata[key]
                                 for key in (
                                     "ruby_resolution_schema",
+                                    "csharp_member",
                                     "ruby_method_kind",
                                     "ruby_lookup_unsafe",
                                     "python_opaque_bases",

@@ -1,3 +1,4 @@
+# Modified by Kodem.
 """C# cross-file resolution.
 
 The config-driven C# *extractor* (``extract_csharp`` → ``_extract_generic``)
@@ -43,6 +44,11 @@ def _build_csharp_type_def_index(
             metadata = {}
 
         if metadata.get("is_nested_type"):
+            continue
+        # A property or enum member is a member, not a type (#3212). Read off
+        # the node itself, so the index stays right where the `defines` /
+        # `case_of` edges are not at hand.
+        if metadata.get("csharp_member"):
             continue
 
         nid = node.get("id")

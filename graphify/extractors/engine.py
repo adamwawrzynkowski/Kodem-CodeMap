@@ -4867,7 +4867,10 @@ def _csharp_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: 
             _make_id(parent_class_nid, member_name), member_name, member_groups or {}
         )
         if member_nid not in seen_ids:
-            add_node_fn(member_nid, member_name, line)
+            # `csharp_member` marks the node a member, not a type, on the node
+            # itself, so the type-definition index skips it even without the
+            # `case_of` edge at hand (#3212).
+            add_node_fn(member_nid, member_name, line, metadata={"csharp_member": "enum_member"})
             add_edge_fn(parent_class_nid, member_nid, "case_of", line)
         return True
     if node.type == "namespace_declaration":
@@ -7502,7 +7505,8 @@ def _extract_generic(
                         property_name, csharp_member_groups,
                     )
                     if property_nid not in seen_ids:
-                        add_node(property_nid, property_name, property_line)
+                        add_node(property_nid, property_name, property_line,
+                                 metadata={"csharp_member": "property"})
                         add_edge(parent_class_nid, property_nid, "defines",
                                  property_line, context="field")
                     emit_csharp_attributes(node, property_nid, property_line)
