@@ -4,13 +4,20 @@
 # Nothing is staged unless every build succeeds. Each target builds on a runner of that target,
 # because the dependencies include native wheels.
 #
-# Start it with Run workflow. A ruleset reserves release tags for the owner's accounts, so publish
+# Start it with Run workflow, or let Kodem's build scripts start it (scripts/codemap-runtime.sh in
+# kodem-ade), which also publish the draft. A ruleset reserves release tags for the owner's accounts, so publish
 # the draft on the Releases page; that creates the tag. Kodem downloads
 # releases/download/v<version>/kodem-codemap-<version>-<target>.tar.gz.
 name: Runtime release
+run-name: Runtime release${{ inputs.request && format(' · {0}', inputs.request) || '' }}
 
 on:
   workflow_dispatch:
+    inputs:
+      request:
+        description: An identifier that names the run, so that the command that starts it can find it
+        required: false
+        default: ""
 
 permissions:
   contents: read
