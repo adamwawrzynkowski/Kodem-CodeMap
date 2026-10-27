@@ -1,3 +1,4 @@
+# Modified by Kodem.
 """graphify command dispatch — every non-install subcommand.
 
 Extracted verbatim from __main__.main(); __main__ now calls dispatch_command(cmd)
@@ -4383,6 +4384,7 @@ def dispatch_command(cmd: str) -> None:
                             "_ts_public_twin", "_py_property", "_java_ret",
                             "_ts_fields", "_ts_static_fields",
                             "_py_fixture", "_py_return_type",
+                            "_rust_ret", "_rust_ret_ok", "_rust_fields",
                         ):
                             if _node.get(_marker):
                                 _ctx_node[_marker] = _node[_marker]

@@ -1,3 +1,4 @@
+# Modified by Kodem.
 # monitor a folder and auto-trigger --update when files change
 # Modified by Kodem.
 from __future__ import annotations
@@ -2337,6 +2338,7 @@ def _rebuild_code(
                         "_ts_public_twin", "_py_property", "_java_ret",
                         "_ts_fields", "_ts_static_fields",
                         "_py_fixture", "_py_return_type",
+                        "_rust_ret", "_rust_ret_ok", "_rust_fields",
                     ):
                         if node.get(marker):
                             ctx_node[marker] = node[marker]
