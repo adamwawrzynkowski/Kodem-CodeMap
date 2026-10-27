@@ -29,6 +29,7 @@ from .resolver_registry import (
 from .ruby_resolution import resolve_ruby_member_calls
 from .csharp_dispatch import resolve_csharp_interface_dispatch
 from .swift_dispatch import resolve_swift_protocol_dispatch
+from .rust_dispatch import resolve_rust_trait_dispatch
 from .pascal_resolution import resolve_pascal_inherited_calls
 from .markdown_resolution import MARKDOWN_MENTION_SUFFIXES, resolve_markdown_mentions
 
@@ -8243,6 +8244,11 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("rust_scoped_calls", frozenset({".rs"}), _resolve_rust_scoped_calls)
+)
+# Rust trait dispatch: a call through a trait-typed receiver lands on the trait's
+# method; link it to each `impl Trait for X` method (graphify.rust_dispatch).
+register_language_resolver(
+    LanguageResolver("rust_trait_dispatch", frozenset({".rs"}), resolve_rust_trait_dispatch)
 )
 register_language_resolver(
     LanguageResolver("vbnet_partial_calls", frozenset({".vb"}), resolve_vbnet_partial_calls)

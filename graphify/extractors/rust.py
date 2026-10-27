@@ -476,8 +476,48 @@ def _rust_generic_names(node, source: bytes) -> frozenset[str]:
     return frozenset(names)
 
 
+def _rust_trait_bound_name(bounds_node, source: bytes) -> str | None:
+    """The one trait a `T: A + Send` bound list names besides std's marker and
+    derive traits (`Send`, `Clone`, `Debug`, ...), else None."""
+    names = []
+    for bound in bounds_node.named_children if bounds_node is not None else ():
+        if bound.type in ("type_identifier", "scoped_type_identifier", "generic_type"):
+            name = _rust_type_last_segment(_read_text(bound, source))
+            if name and name not in _RUST_BUILTIN_TYPES:
+                names.append(name)
+    return names[0] if len(names) == 1 else None
+
+
+def _rust_generic_bounds(node, source: bytes) -> dict[str, str]:
+    """Type parameter -> the one trait it is bound by, for every enclosing fn,
+    impl and trait: `fn f<M: Matcher>` and `where M: Matcher` give
+    {"M": "Matcher"}. A parameter with no such bound, or two, is left out."""
+    found: dict[str, set[str | None]] = {}
+    while node is not None:
+        if node.type in ("function_item", "impl_item", "trait_item", "struct_item", "enum_item"):
+            params = node.child_by_field_name("type_parameters")
+            for p in params.named_children if params is not None else ():
+                name = p.child_by_field_name("name")
+                if p.type == "type_parameter" and name is not None:
+                    found.setdefault(_read_text(name, source), set()).add(
+                        _rust_trait_bound_name(p.child_by_field_name("bounds"), source))
+            where = next((c for c in node.named_children if c.type == "where_clause"), None)
+            for pred in where.named_children if where is not None else ():
+                left = pred.child_by_field_name("left")
+                if left is not None and left.type == "type_identifier":
+                    found.setdefault(_read_text(left, source), set()).add(
+                        _rust_trait_bound_name(pred.child_by_field_name("bounds"), source))
+        node = node.parent
+    bounds: dict[str, str] = {}
+    for name, traits in found.items():
+        named = {t for t in traits if t}
+        if len(named) == 1:
+            bounds[name] = next(iter(named))
+    return bounds
+
+
 def _rust_named_type(type_node, source: bytes, self_type: str | None,
-                     generics: frozenset[str]) -> str | None:
+                     generics: frozenset[str], bounds: dict[str, str] | None = None) -> str | None:
     """The concrete type a value of ``type_node`` has, for a method call on it.
 
     `Foo`, `&Foo`, `&mut a::Foo<T>` -> `Foo`; `Box<Foo>`, `Arc<Foo>`, `Rc<Foo>`
@@ -489,6 +529,16 @@ def _rust_named_type(type_node, source: bytes, self_type: str | None,
         t = t.child_by_field_name("type")
     if t is None:
         return None
+    if t.type in ("abstract_type", "dynamic_type"):
+        # `impl Matcher` / `dyn Matcher`: the trait, whose method the call names.
+        trait = t.child_by_field_name("trait")
+        if trait is None or trait.type not in ("type_identifier", "scoped_type_identifier", "generic_type"):
+            return None
+        trait_text = _read_text(trait, source)
+        name = _rust_type_last_segment(trait_text)
+        if trait.type == "scoped_type_identifier" or "::" in trait_text.split("<", 1)[0]:
+            name = _rust_crate_local_type(trait_text.split("<", 1)[0])
+        return name if name and name[:1].isupper() and name not in _RUST_BUILTIN_TYPES else None
     if t.type == "generic_type":
         base = t.child_by_field_name("type")
         base_text = _read_text(base, source) if base is not None else ""
@@ -496,7 +546,7 @@ def _rust_named_type(type_node, source: bytes, self_type: str | None,
         args = t.child_by_field_name("type_arguments")
         inner = [a for a in args.named_children if a.type != "lifetime"] if args is not None else []
         if outer in _RUST_DEREF_WRAPPERS and inner:
-            return _rust_named_type(inner[0], source, self_type, generics)
+            return _rust_named_type(inner[0], source, self_type, generics, bounds)
         name = _rust_crate_local_type(base_text) if "::" in base_text else outer
     elif t.type == "type_identifier":
         name = _read_text(t, source)
@@ -506,7 +556,10 @@ def _rust_named_type(type_node, source: bytes, self_type: str | None,
         return None
     if name == "Self":
         name = _rust_type_last_segment(self_type) if self_type else ""
-    if not name or name in generics or not name[:1].isupper() or name in _RUST_FALLIBLE_WRAPPERS:
+    if name in generics:
+        # `m: M` with `M: Matcher`: the trait bounds what `m.find()` can call.
+        return (bounds or {}).get(name)
+    if not name or not name[:1].isupper() or name in _RUST_FALLIBLE_WRAPPERS:
         return None
     return name
 
@@ -529,6 +582,7 @@ def _rust_return_types(fn_node, source: bytes, self_type: str | None) -> tuple[s
     if ret is None:
         return None, None
     generics = _rust_generic_names(fn_node, source)
+    bounds = _rust_generic_bounds(fn_node, source)
     t = ret
     while t is not None and t.type == "reference_type":
         t = t.child_by_field_name("type")
@@ -537,8 +591,8 @@ def _rust_return_types(fn_node, source: bytes, self_type: str | None) -> tuple[s
         if outer in _RUST_FALLIBLE_WRAPPERS:
             args = t.child_by_field_name("type_arguments")
             inner = [a for a in args.named_children if a.type != "lifetime"] if args is not None else []
-            return None, (_rust_named_type(inner[0], source, self_type, generics) if inner else None)
-    return _rust_named_type(ret, source, self_type, generics), None
+            return None, (_rust_named_type(inner[0], source, self_type, generics, bounds) if inner else None)
+    return _rust_named_type(ret, source, self_type, generics, bounds), None
 
 
 def _rust_binding_name(pattern):
@@ -566,6 +620,7 @@ class _RustReceiverTyper:
         self.source = source
         self.self_type = _rust_type_last_segment(self_type) if self_type else None
         self.generics = _rust_generic_names(fn_node, source)
+        self.bounds = _rust_generic_bounds(fn_node, source)
         # Types the fn's module imports from a crate other than std/core/alloc:
         # name -> crate. The corpus pass binds them only to that crate's type.
         scope = _rust_scope(fn_node)
@@ -663,7 +718,7 @@ class _RustReceiverTyper:
             if b is None:
                 return None
             if b[3] is not None:
-                named = _rust_named_type(b[3], src, self.self_type, self.generics)
+                named = _rust_named_type(b[3], src, self.self_type, self.generics, self.bounds)
                 return self._typed(named) if named else None
             return self.describe(b[4], b[0], depth + 1)
         if t in ("reference_expression", "parenthesized_expression", "unary_expression", "await_expression"):
@@ -1143,6 +1198,7 @@ def extract_rust(path: Path) -> dict:
                                              context="generic_arg")
                 if t in ("struct_item", "union_item"):
                     struct_generics = _rust_generic_names(node, source)
+                    struct_bounds = _rust_generic_bounds(node, source)
                     for c in node.children:
                         if c.type != "field_declaration_list":
                             continue
@@ -1152,7 +1208,7 @@ def extract_rust(path: Path) -> dict:
                             type_node = field.child_by_field_name("type")
                             field_name = field.child_by_field_name("name")
                             field_type = (
-                                _rust_named_type(type_node, source, item_name, struct_generics)
+                                _rust_named_type(type_node, source, item_name, struct_generics, struct_bounds)
                                 if type_node is not None else None
                             )
                             if field_name is not None and field_type:
