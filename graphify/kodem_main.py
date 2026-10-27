@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 GRAPHIFY_VERSION = "0.9.96"
 SCHEMA = 1
 RESULT_PREFIX = "KODEM-CODEMAP-RESULT "
@@ -276,7 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = commands.add_parser("serve", help="run the MCP server of a map on stdio")
     serve.add_argument("graph")
-    serve.add_argument("--activity", default=None, help="file that tells Kodem when agents read the map")
+    serve.add_argument("--activity", default=None, help="log that tells Kodem what agents read in the map")
     serve.set_defaults(handler=command_serve)
 
     version = commands.add_parser("version", help="print the versions")

@@ -39,31 +39,59 @@ def kodem_mode() -> bool:
     return os.environ.get("GRAPHIFY_KODEM_MCP", "").lower() in ("1", "true", "yes")
 
 
-# Kodem shows when agents read a map. With GRAPHIFY_KODEM_ACTIVITY naming a file
-# (graphify.kodem_main serve --activity), each Kodem tool call replaces that file
-# with {"tool", "busy", "at"} when it starts and when it ends; "at" is in
-# wall-clock milliseconds.
+# Kodem shows what agents read in a map. With GRAPHIFY_KODEM_ACTIVITY naming a
+# log (graphify.kodem_main serve --activity), each Kodem tool call appends one
+# JSON line when it starts and one when it ends:
+# {"call", "tool", "subject", "busy", "at"}, with "at" in wall-clock
+# milliseconds. A log past _KODEM_ACTIVITY_LIMIT bytes moves to "<log>.1" first.
 _KODEM_ACTIVITY_VARIABLE = "GRAPHIFY_KODEM_ACTIVITY"
+_KODEM_ACTIVITY_LIMIT = 64 * 1024
+_KODEM_SUBJECT_LIMIT = 160
+_kodem_calls = 0
 
 
-def record_activity(tool: str, busy: bool) -> None:
-    """Writes the read state of the map for Kodem. A failed write never fails the call."""
+def activity_subject(tool: str, arguments: dict) -> str:
+    """Returns what a Kodem tool call asks about, in one short line."""
+    if tool == "shortest_path":
+        subject = f"{arguments.get('source', '')} → {arguments.get('target', '')}"
+    else:
+        subject = str(arguments.get("question") or arguments.get("label") or "")
+    subject = " ".join(subject.split())
+    if len(subject) > _KODEM_SUBJECT_LIMIT:
+        subject = subject[: _KODEM_SUBJECT_LIMIT - 1] + "…"
+    return subject
+
+
+def start_activity(tool: str, subject: str) -> str:
+    """Records the start of a Kodem tool call and returns the call's identity."""
+    global _kodem_calls
+    _kodem_calls += 1
+    call = f"{os.getpid()}:{_kodem_calls}"
+    record_activity(call, tool, subject, True)
+    return call
+
+
+def record_activity(call: str, tool: str, subject: str, busy: bool) -> None:
+    """Appends one state of a call to Kodem's activity log. A failed write never fails the call."""
     target = os.environ.get(_KODEM_ACTIVITY_VARIABLE)
     if not target:
         return
     path = Path(target)
-    staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    line = json.dumps(
+        {"call": call, "tool": tool, "subject": subject, "busy": busy, "at": int(time.time() * 1000)},
+        ensure_ascii=False,
+    )
     try:
-        staged.write_text(
-            json.dumps({"tool": tool, "busy": busy, "at": int(time.time() * 1000)}),
-            encoding="utf-8",
-        )
-        os.replace(staged, path)
+        if path.stat().st_size > _KODEM_ACTIVITY_LIMIT:
+            os.replace(path, path.with_name(path.name + ".1"))
     except OSError:
-        try:
-            staged.unlink()
-        except OSError:
-            pass
+        pass
+    try:
+        # One write of a short line in append mode, so the lines of several servers do not mix.
+        with open(path, "a", encoding="utf-8") as log:
+            log.write(line + "\n")
+    except OSError:
+        pass
 
 
 def default_depth() -> int:
@@ -2937,8 +2965,8 @@ def _build_server(graph_path: str):
             project_path = None
         if not handler:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
-        if kodem_mode():
-            record_activity(name, True)
+        subject = activity_subject(name, arguments) if kodem_mode() else ""
+        call = start_activity(name, subject) if kodem_mode() else None
         try:
             _select_graph(project_path)  # bind G/communities to the target graph
             return [types.TextContent(type="text", text=handler(arguments))]
@@ -2950,8 +2978,8 @@ def _build_server(graph_path: str):
         except Exception as exc:
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
         finally:
-            if kodem_mode():
-                record_activity(name, False)
+            if call is not None:
+                record_activity(call, name, subject, False)
 
     if hasattr(Server, "list_tools"):
         # mcp 1.x: decorator-based registration. The SDK wraps the raw returns

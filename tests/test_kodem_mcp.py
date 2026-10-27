@@ -108,20 +108,41 @@ def test_answers_are_compact(graph: Path) -> None:
     assert "validate" in node
 
 
-def test_the_activity_file_reports_the_last_read(graph: Path, tmp_path: Path) -> None:
-    activity = tmp_path / "activity.json"
+def test_the_activity_log_records_each_call_and_what_it_asked(graph: Path, tmp_path: Path) -> None:
+    activity = tmp_path / "activity.jsonl"
     before = int(time.time() * 1000)
     asyncio.run(
-        _session_calls(graph, [("get_node", {"label": "validate"})], ("--activity", str(activity)))
+        _session_calls(
+            graph,
+            [("get_node", {"label": "validate"}), ("shortest_path", {"source": "handle", "target": "write"})],
+            ("--activity", str(activity)),
+        )
     )
-    state = json.loads(activity.read_text(encoding="utf-8"))
-    assert state["tool"] == "get_node" and state["busy"] is False
-    assert state["at"] >= before
-    assert [path.name for path in tmp_path.iterdir()] == ["activity.json"]
+    lines = [json.loads(line) for line in activity.read_text(encoding="utf-8").splitlines()]
+    assert [(line["tool"], line["busy"]) for line in lines] == [
+        ("get_node", True),
+        ("get_node", False),
+        ("shortest_path", True),
+        ("shortest_path", False),
+    ]
+    assert lines[0]["subject"] == "validate" and lines[2]["subject"] == "handle → write"
+    assert lines[0]["call"] == lines[1]["call"] != lines[2]["call"]
+    assert all(line["at"] >= before for line in lines)
+    assert [path.name for path in tmp_path.iterdir()] == ["activity.jsonl"]
+
+
+def test_a_full_activity_log_moves_aside(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    activity = tmp_path / "activity.jsonl"
+    activity.write_text("x" * (serve._KODEM_ACTIVITY_LIMIT + 1), encoding="utf-8")
+    monkeypatch.setenv("GRAPHIFY_KODEM_ACTIVITY", str(activity))
+    serve.record_activity("1:1", "query_graph", "a " * 200, True)
+    assert (tmp_path / "activity.jsonl.1").stat().st_size > serve._KODEM_ACTIVITY_LIMIT
+    assert json.loads(activity.read_text(encoding="utf-8"))["tool"] == "query_graph"
+    assert len(serve.activity_subject("query_graph", {"question": "a " * 200})) == serve._KODEM_SUBJECT_LIMIT
 
 
 def test_hidden_tools_leave_no_activity(graph: Path, tmp_path: Path) -> None:
-    activity = tmp_path / "activity.json"
+    activity = tmp_path / "activity.jsonl"
     asyncio.run(_session_calls(graph, [("list_prs", {})], ("--activity", str(activity))))
     assert not activity.exists()
 
@@ -130,7 +151,7 @@ def test_the_activity_path_must_be_absolute(graph: Path) -> None:
     from graphify import kodem_main
 
     process = subprocess.run(
-        [sys.executable, "-m", "graphify.kodem_main", "serve", str(graph), "--activity", "relative.json"],
+        [sys.executable, "-m", "graphify.kodem_main", "serve", str(graph), "--activity", "relative.jsonl"],
         capture_output=True,
         text=True,
         timeout=60,
