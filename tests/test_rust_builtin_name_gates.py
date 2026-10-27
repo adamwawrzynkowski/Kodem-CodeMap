@@ -86,3 +86,18 @@ def test_prelude_drop_never_binds_a_corpus_fn(tmp_path: Path):
         "src/b.rs": "pub fn go(v: Vec<u8>) { drop(v) }\n",
     })
     assert not _hit(calls, "go()", "drop()", "src/a.rs"), calls
+
+
+def test_bare_name_in_two_crates_binds_through_its_use(tmp_path: Path):
+    calls = _calls(tmp_path, {
+        "crates/ui/Cargo.toml": "[package]\nname = \"ui\"\n",
+        "crates/ui/src/lib.rs": "pub mod geometry;\npub use geometry::*;\n",
+        "crates/ui/src/geometry.rs": "pub fn px(v: f32) -> f32 { v }\n",
+        "crates/app/src/main.rs": "mod theme;\nmod view;\n",
+        "crates/app/src/theme.rs": "pub fn px(v: f32) -> f32 { v * 2.0 }\n",
+        "crates/app/src/view.rs": "use crate::theme::px;\npub fn draw() -> f32 { px(1.0) }\n",
+        "crates/app/src/other.rs": "use ui::px;\npub fn paint() -> f32 { px(1.0) }\n",
+    })
+    assert _hit(calls, "draw()", "px()", "crates/app/src/theme.rs"), calls
+    assert not _hit(calls, "draw()", "px()", "crates/ui/src/geometry.rs"), calls
+    assert _hit(calls, "paint()", "px()", "crates/ui/src/geometry.rs"), calls

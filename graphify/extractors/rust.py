@@ -1727,6 +1727,14 @@ def extract_rust(path: Path) -> dict:
                         rc_entry["rust_self_type"] = self_type
                         if self_impl_key:
                             rc_entry["rust_self_impl_key"] = self_impl_key
+                    if not is_member_call:
+                        # `use crate::theme::px; px(1.)`: the path the name was
+                        # imported by, so a name defined in two crates binds to
+                        # the imported one.
+                        scope = _rust_scope(node)
+                        bound = _rust_use_paths(scope, source).get(callee_name) if scope is not None else None
+                        if bound:
+                            rc_entry["rust_use_path"] = bound
                     raw_calls.append(rc_entry)
         for child in node.children:
             walk_calls(child, caller_nid, self_type, self_impl_key, typer, mods)

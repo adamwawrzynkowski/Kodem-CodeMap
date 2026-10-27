@@ -7696,6 +7696,27 @@ class _RustCorpusIndex:
             found = {m for m in found if self.callable_from(m, caller)}
         return next(iter(found)) if len(found) == 1 else None
 
+    def narrow_by_use_path(self, candidates: list[str], use_path: list[str], caller: str) -> list[str]:
+        """The candidates a `use` path can name: those in the crate the path
+        starts at (`crate::`/`self::`/`super::` the caller's, a corpus crate's
+        name that crate), and of those the ones in the module the path names
+        when any is (an item re-exported through `pub use` sits elsewhere)."""
+        head = use_path[0] if use_path else ""
+        caller_file = self.file(caller)
+        if head in ("crate", "self", "super"):
+            roots = {self.crate(caller_file)}
+        else:
+            roots = self.roots_by_crate_name.get(head, set())
+        if not roots:
+            return []
+        in_crate = [
+            c for c in candidates
+            if any(self.in_crate(self.file(c), root) for root in roots)
+        ]
+        module = tuple(use_path[1:-1]) if head == "crate" or head not in ("self", "super") else None
+        exact = [c for c in in_crate if module is not None and self.module_path(c) == module]
+        return exact or in_crate
+
     def test_only(self, nid: str) -> bool:
         """Whether node ``nid`` is test code: under `#[cfg(test)]` / `#[test]`,
         or in a test file."""
@@ -11737,7 +11758,15 @@ def extract(
             elif is_rust_call:
                 # Rust: a bare name defined more than once binds only through a
                 # `use` of exactly one of them; path proximity guessed (#2313).
-                continue
+                narrowed = (
+                    _rust_corpus.narrow_by_use_path(
+                        candidates, [str(p) for p in rc["rust_use_path"]], str(rc.get("caller_nid", "")))
+                    if _rust_corpus is not None and rc.get("rust_use_path") else []
+                )
+                if len(narrowed) != 1:
+                    continue
+                tgt = narrowed[0]
+                has_import_evidence = True
             else:
                 module_matches = [
                     c for c in candidates
