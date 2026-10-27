@@ -28,7 +28,7 @@ The archive root holds:
 
 ### Commands
 
-Kodem runs `<interpreter> -m graphify.kodem_main <command> ...`. Every command:
+Kodem runs `<interpreter> -P -m graphify.kodem_main <command> ...`. `-P` keeps the working folder, which can be a repository, out of the module path. Every command:
 
 - writes progress as plain lines on stderr;
 - prints its result as the last line of stdout, in the form `KODEM-CODEMAP-RESULT <json>`;
