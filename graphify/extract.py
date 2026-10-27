@@ -7678,9 +7678,19 @@ class _RustCorpusIndex:
         """The one method ``name`` across the impl blocks of ``owner`` in its
         crate; with ``caller``, only among the methods ``caller`` may call."""
         type_name, decl_file = owner
+        # Two types of this name in one crate (`icons::Icon`, `kit::Icon`): an
+        # impl block elsewhere could be either one's, so only the declaring
+        # file's own blocks count.
+        same_name_decls = [
+            d for d in self.declared_by_type.get(type_name, [])
+            if self.same_crate(self.file(d), decl_file)
+        ]
         found: set[str] = set()
         for nid in self.owners_by_type.get(type_name, []):
-            if self.same_crate(self.file(nid), decl_file):
+            owner_file = self.file(nid)
+            if len(same_name_decls) > 1 and not self.same(owner_file, decl_file):
+                continue
+            if self.same_crate(owner_file, decl_file):
                 found |= self.methods_by_owner.get((nid, name), set())
         if caller is not None:
             found = {m for m in found if self.callable_from(m, caller)}

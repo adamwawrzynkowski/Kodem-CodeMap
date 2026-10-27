@@ -323,3 +323,14 @@ def test_two_impls_in_one_file_bind_by_receiver_type(tmp_path: Path):
     assert len(targets) == 1, calls
     method_owner = {e["target"]: e["source"] for e in r["edges"] if e["relation"] == "method"}
     assert nodes[method_owner[targets[0]]]["label"] == "A", targets
+
+
+def test_two_same_named_types_in_one_crate_do_not_pool_methods(tmp_path: Path):
+    # `icons::Icon` has no `size`; the call must not reach `kit::Icon::size`.
+    calls = _calls(tmp_path, {
+        "src/lib.rs": "pub mod icons;\npub mod kit;\npub mod app;\n",
+        "src/icons.rs": "pub struct Icon;\npub fn icon() -> Icon { Icon }\n",
+        "src/kit.rs": "pub struct Icon;\nimpl Icon { pub fn size(self) -> Self { self } }\n",
+        "src/app.rs": "use crate::icons::icon;\npub fn go() { let _ = icon().size(); }\n",
+    })
+    assert not _hit(calls, "go()", ".size()", "src/kit.rs"), calls
