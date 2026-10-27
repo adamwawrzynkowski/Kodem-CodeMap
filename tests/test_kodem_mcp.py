@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -55,12 +56,14 @@ def graph(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out / "graph.json"
 
 
-async def _session_calls(graph_path: Path, calls: list[tuple[str, dict]]) -> tuple[object, list, list[str]]:
+async def _session_calls(
+    graph_path: Path, calls: list[tuple[str, dict]], options: tuple[str, ...] = ()
+) -> tuple[object, list, list[str]]:
     """Lists the tools and runs ``calls`` against a served map; returns the init result, tools and texts."""
     environment = {key: value for key, value in os.environ.items() if not key.startswith("PYTEST")}
     parameters = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "graphify.kodem_main", "serve", str(graph_path)],
+        args=["-m", "graphify.kodem_main", "serve", str(graph_path), *options],
         env=environment,
     )
     async with stdio_client(parameters) as (read, write):
@@ -103,6 +106,36 @@ def test_answers_are_compact(graph: Path) -> None:
     assert "write" in path
     assert "save" in neighbors
     assert "validate" in node
+
+
+def test_the_activity_file_reports_the_last_read(graph: Path, tmp_path: Path) -> None:
+    activity = tmp_path / "activity.json"
+    before = int(time.time() * 1000)
+    asyncio.run(
+        _session_calls(graph, [("get_node", {"label": "validate"})], ("--activity", str(activity)))
+    )
+    state = json.loads(activity.read_text(encoding="utf-8"))
+    assert state["tool"] == "get_node" and state["busy"] is False
+    assert state["at"] >= before
+    assert [path.name for path in tmp_path.iterdir()] == ["activity.json"]
+
+
+def test_hidden_tools_leave_no_activity(graph: Path, tmp_path: Path) -> None:
+    activity = tmp_path / "activity.json"
+    asyncio.run(_session_calls(graph, [("list_prs", {})], ("--activity", str(activity))))
+    assert not activity.exists()
+
+
+def test_the_activity_path_must_be_absolute(graph: Path) -> None:
+    from graphify import kodem_main
+
+    process = subprocess.run(
+        [sys.executable, "-m", "graphify.kodem_main", "serve", str(graph), "--activity", "relative.json"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert process.returncode == kodem_main.EXIT_USAGE
 
 
 def test_hidden_upstream_tools_cannot_be_called(graph: Path) -> None:

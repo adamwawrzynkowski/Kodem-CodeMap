@@ -41,7 +41,7 @@ Kodem runs `<interpreter> -P -m graphify.kodem_main <command> ...`. `-P` keeps t
 | `build <repo> --out <dir>` | Maps `<repo>` from the beginning into `<dir>` | `{"nodes": n, "edges": n, "files": n, "commit": "<sha>" or null}` |
 | `update <repo> --out <dir>` | Updates the map in `<dir>` for the changes in `<repo>`. Without a map it acts as `build` | same as `build` |
 | `html --out <dir> [--theme dark\|light] [--node-limit n]` | Writes `<dir>/graph.html` from `<dir>/graph.json` | `{"html": "<path>"}` |
-| `serve <dir>/graph.json` | Runs the MCP server on stdio | none |
+| `serve <dir>/graph.json [--activity <file>]` | Runs the MCP server on stdio. With `--activity`, it tells Kodem when agents read the map (see MCP server) | none |
 | `version` | Prints the versions | `{"version": "<version>", "graphify": "0.9.96", "schema": 1}` |
 
 `<repo>` and `<dir>` are absolute paths. `<dir>` holds `graph.json` directly. A map folder can be copied to another folder and updated against another checkout of the same repository, such as a git worktree.
@@ -49,6 +49,8 @@ Kodem runs `<interpreter> -P -m graphify.kodem_main <command> ...`. `-P` keeps t
 ### MCP server
 
 Server name `kodem-codemap`. Tools: `query_graph`, `get_node`, `get_neighbors`, `shortest_path`. The server reloads `graph.json` when the file changes.
+
+With `--activity <file>` (an absolute path, since 0.1.1), each call of one of the four tools replaces `<file>` when it starts and again when it ends: `{"tool": "<name>", "busy": true|false, "at": <wall-clock milliseconds>}`. The server writes a temporary file beside it and renames it, so a reader never sees half a file. A failed write does not fail the call.
 
 ## Changes
 
@@ -59,6 +61,7 @@ Server name `kodem-codemap`. Tools: `query_graph`, `get_node`, `get_neighbors`, 
 | Kodem entry point `graphify.kodem_main`: build, update, html, serve, version; no LLM, no network, writes only to `--out`; build and update share the update pipeline | #3300, #4361, #4624 | `graphify/kodem_main.py`, `pyproject.toml`, `tests/test_kodem_main.py` |
 | `GRAPHIFY_NO_VIZ=1`: updates never write `graph.html` or its stale marker, and the no-change gate ignores the page | — | `graphify/watch.py` |
 | Kodem MCP mode (`GRAPHIFY_KODEM_MCP=1`): server `kodem-codemap` with instructions; 4 tools with short schemas and no `project_path` (about 400 tokens instead of 1,600); answers grouped by file with empty fields left out; default depth 2 and budget 1,200; trailing edges cut to the budget. On the Kodem map the average answer fell from about 2,160 to about 1,340 tokens | #4469, #2784 | `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_mcp.py` |
+| Read activity for Kodem: `serve --activity <file>` records each tool call's start and end, so Kodem shows when agents read a map | none | `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_mcp.py` |
 | CI for the fork: contract tests on macOS, Windows and Linux, the upstream suite on Linux with the base's known failures deselected; upstream publish, release-graph, welcome and PR-management workflows removed; Dependabot for pinned actions | — | `.github/`, `tests/kodem_known_failures.txt` |
 | Runtime archive build (`scripts/kodem/build_runtime.py`) and the draft-release workflow | — | `scripts/kodem/`, `.github/workflows/runtime.yml` |
 | Rust accuracy: typed receivers (port of PR #4299), cross-file `Type::f()` and `module::f()`, Rust-only builtin gates, mod-path IDs with visibility and `cfg(test)` metadata and filters, trait names in impl method IDs, trait dispatch, no pooling of same-named types, ambiguous bare calls bound through `use`. On kodem-ade: Rust `calls` edges 11,643 → 15,455, and 15 sampled edges 10 → 14 correct | #4296, #2135, #2313, #2774, #4285, #2041 | `graphify/extractors/rust.py`, `graphify/extract.py`, `graphify/rust_dispatch.py`, `graphify/cache.py`, `tests/test_rust_*.py` |

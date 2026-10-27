@@ -11,6 +11,7 @@ from array import array
 from collections import OrderedDict
 from pathlib import Path
 import threading
+import time
 from typing import NamedTuple
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -36,6 +37,33 @@ _KODEM_DEFAULT_BUDGET = 1200
 def kodem_mode() -> bool:
     """Returns whether the server runs as Kodem's Code Map server."""
     return os.environ.get("GRAPHIFY_KODEM_MCP", "").lower() in ("1", "true", "yes")
+
+
+# Kodem shows when agents read a map. With GRAPHIFY_KODEM_ACTIVITY naming a file
+# (graphify.kodem_main serve --activity), each Kodem tool call replaces that file
+# with {"tool", "busy", "at"} when it starts and when it ends; "at" is in
+# wall-clock milliseconds.
+_KODEM_ACTIVITY_VARIABLE = "GRAPHIFY_KODEM_ACTIVITY"
+
+
+def record_activity(tool: str, busy: bool) -> None:
+    """Writes the read state of the map for Kodem. A failed write never fails the call."""
+    target = os.environ.get(_KODEM_ACTIVITY_VARIABLE)
+    if not target:
+        return
+    path = Path(target)
+    staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        staged.write_text(
+            json.dumps({"tool": tool, "busy": busy, "at": int(time.time() * 1000)}),
+            encoding="utf-8",
+        )
+        os.replace(staged, path)
+    except OSError:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
 
 
 def default_depth() -> int:
@@ -2909,6 +2937,8 @@ def _build_server(graph_path: str):
             project_path = None
         if not handler:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
+        if kodem_mode():
+            record_activity(name, True)
         try:
             _select_graph(project_path)  # bind G/communities to the target graph
             return [types.TextContent(type="text", text=handler(arguments))]
@@ -2919,6 +2949,9 @@ def _build_server(graph_path: str):
             raise
         except Exception as exc:
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
+        finally:
+            if kodem_mode():
+                record_activity(name, False)
 
     if hasattr(Server, "list_tools"):
         # mcp 1.x: decorator-based registration. The SDK wraps the raw returns

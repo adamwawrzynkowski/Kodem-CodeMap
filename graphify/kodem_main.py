@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 GRAPHIFY_VERSION = "0.9.96"
 SCHEMA = 1
 RESULT_PREFIX = "KODEM-CODEMAP-RESULT "
@@ -240,6 +240,11 @@ def command_serve(arguments: argparse.Namespace) -> None:
     graph_path = Path(arguments.graph)
     if not graph_path.is_absolute():
         fail(f"path must be absolute: {arguments.graph}", EXIT_USAGE)
+    if arguments.activity:
+        activity = Path(arguments.activity)
+        if not activity.is_absolute():
+            fail(f"path must be absolute: {arguments.activity}", EXIT_USAGE)
+        os.environ["GRAPHIFY_KODEM_ACTIVITY"] = str(activity)
     serve(str(graph_path))
 
 
@@ -271,6 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = commands.add_parser("serve", help="run the MCP server of a map on stdio")
     serve.add_argument("graph")
+    serve.add_argument("--activity", default=None, help="file that tells Kodem when agents read the map")
     serve.set_defaults(handler=command_serve)
 
     version = commands.add_parser("version", help="print the versions")
