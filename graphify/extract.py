@@ -7506,6 +7506,183 @@ def _rust_corpus_crate_names(paths, crate_roots) -> frozenset[str]:
     return frozenset(names)
 
 
+class _RustCorpusIndex:
+    """Rust declarations of a corpus, indexed for the cross-file call passes.
+
+    Shared by the typed-receiver and the qualified-path passes: types and free
+    functions by name, methods by owner node, and each file's crate and module
+    path. On a changed-files rebuild the unchanged corpus comes back from
+    graph.json with root-relative paths while re-extracted files carry absolute
+    ones, so two paths match when equal or when the absolute one ends with the
+    other.
+    """
+
+    def __init__(self, all_nodes: list[dict], all_edges: list[dict], raw: list[dict]) -> None:
+        from graphify.extractors.rust import _rust_type_last_segment
+
+        self.node_by_id: dict[str, dict] = {str(n.get("id")): n for n in all_nodes if n.get("id")}
+        contains_targets = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
+        self.owners_by_type: dict[str, list[str]] = {}
+        self.declared_by_type: dict[str, list[str]] = {}
+        self.free_fns: dict[str, list[str]] = {}
+        for n in all_nodes:
+            source_file = str(n.get("source_file") or "")
+            if not source_file.endswith(".rs"):
+                continue
+            label, nid = str(n.get("label") or ""), str(n.get("id") or "")
+            if not nid:
+                continue
+            if label.endswith(")"):
+                if not label.startswith(".") and nid in contains_targets:
+                    self.free_fns.setdefault(label[:-2], []).append(nid)
+                continue
+            bare = _rust_type_last_segment(label)
+            if bare[:1].isupper():
+                self.owners_by_type.setdefault(bare, []).append(nid)
+                if nid in contains_targets and n.get("_rust_declaration_count"):
+                    self.declared_by_type.setdefault(bare, []).append(nid)
+
+        self.methods_by_owner: dict[tuple[str, str], set[str]] = {}
+        for e in all_edges:
+            if e.get("relation") != "method":
+                continue
+            src, tgt = str(e.get("source") or ""), str(e.get("target") or "")
+            tnode = self.node_by_id.get(tgt)
+            if src and tnode is not None:
+                name = str(tnode.get("label", "")).strip("()").lstrip(".")
+                self.methods_by_owner.setdefault((src, name), set()).add(tgt)
+
+        # A file belongs to the deepest crate root above it, so a `tests` module in
+        # `src/` and a crate's own `tests/`, `benches/` and `examples/` stay with
+        # their crate, and a checkout that itself sits under a `src` folder does not
+        # merge every crate into one.
+        rust_paths = {f for f in (self.file(nid) for nid in self.node_by_id) if f.endswith(".rs")}
+        rust_paths |= {str(rc.get("source_file", "")).replace("\\", "/") for rc in raw}
+        self.crate_roots = _rust_crate_roots(rust_paths)
+        self._crate_of: dict[str, str] = {}
+        self._module_of: dict[str, tuple[str, ...]] = {}
+        self.relative_crates = {c for c in self.crate_roots if c and not self.is_abs(c)}
+        self.corpus_crates = _rust_corpus_crate_names(rust_paths, self.crate_roots)
+        self.roots_by_crate_name: dict[str, set[str]] = {}
+        for root in self.crate_roots:
+            names = {root.rsplit("/", 1)[-1].replace("-", "_")} if root else set()
+            manifest = os.path.join(root or ".", "Cargo.toml")
+            if os.path.isfile(manifest):
+                try:
+                    text = Path(manifest).read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                names |= {name.replace("-", "_") for name in _cargo_crate_names(text)}
+            for name in names:
+                self.roots_by_crate_name.setdefault(name, set()).add(root)
+
+    def file(self, nid: str) -> str:
+        """The source file of node ``nid``, with `/` separators."""
+        return str(self.node_by_id.get(nid, {}).get("source_file") or "").replace("\\", "/")
+
+    @staticmethod
+    def is_abs(path: str) -> bool:
+        """Whether ``path`` is absolute (POSIX or a Windows drive)."""
+        return path.startswith("/") or bool(re.match(r"^[A-Za-z]:/", path))
+
+    def crate(self, path: str) -> str:
+        """The crate root of ``path``: the deepest crate root above it."""
+        if path not in self._crate_of:
+            best: str | None = None
+            for root in self.crate_roots:
+                inside = path.startswith(root + "/") if root else not self.is_abs(path)
+                if inside and (best is None or len(root) > len(best)):
+                    best = root
+            self._crate_of[path] = best if best is not None else path.rsplit("/", 1)[0] if "/" in path else ""
+        return self._crate_of[path]
+
+    def same(self, a: str, b: str, crate: bool = False) -> bool:
+        """Whether two file (or, with ``crate``, crate-root) paths are one."""
+        if a == b:
+            return True
+        if self.is_abs(a) == self.is_abs(b):
+            return False
+        absolute, relative = (a, b) if self.is_abs(a) else (b, a)
+        if relative:
+            return absolute.endswith("/" + relative)
+        # the root crate (`src/` at the repo root): no other crate's dir ends it
+        return crate and not any(absolute.endswith("/" + c) for c in self.relative_crates)
+
+    def same_crate(self, a: str, b: str) -> bool:
+        """Whether the files ``a`` and ``b`` are in one crate."""
+        return self.same(self.crate(a), self.crate(b), crate=True)
+
+    def in_crate(self, path: str, root: str) -> bool:
+        """Whether the file ``path`` belongs to the crate rooted at ``root``."""
+        return self.same(self.crate(path), root, crate=True)
+
+    def module_path(self, nid: str) -> tuple[str, ...]:
+        """The module path of node ``nid`` inside its crate: the file's path
+        below `src/` (`src/a/b.rs` and `src/a/b/mod.rs` -> ("a", "b"),
+        `src/lib.rs` -> ()), then any inline `mod` blocks around it. A file
+        outside `src/` (`tests/x.rs`, `benches/`, `examples/`) is a crate root
+        of its own."""
+        cached = self._module_of.get(nid)
+        if cached is not None:
+            return cached
+        path = self.file(nid)
+        root = self.crate(path)
+        if root and path.startswith(root + "/"):
+            parts = path[len(root) + 1:].split("/")
+        elif not root and not self.is_abs(path):
+            parts = path.split("/")
+        else:
+            parts = []
+        if parts and parts[0] == "src" and len(parts) > 2 and parts[1] == "bin":
+            parts = parts[2:]
+            parts = [] if len(parts) == 1 else parts[1:]  # src/bin/x.rs is a root
+        elif parts and parts[0] == "src":
+            parts = parts[1:]
+            if parts in (["lib.rs"], ["main.rs"]):
+                parts = []
+        elif len(parts) > 1:
+            parts = parts[1:]
+            if len(parts) == 1:  # tests/x.rs, benches/x.rs: a root of its own
+                parts = []
+        else:
+            parts = []
+        if parts:
+            last = parts[-1][:-3] if parts[-1].endswith(".rs") else parts[-1]
+            parts = parts[:-1] if last == "mod" else parts[:-1] + [last]
+        inline = self.node_by_id.get(nid, {}).get("_rust_mod_path") or ""
+        module = tuple(parts) + tuple(p for p in str(inline).split("::") if p)
+        self._module_of[nid] = module
+        return module
+
+    def pick(self, nids: list[str], from_file: str) -> str | None:
+        """One definition, or the one in the caller's file, or in its crate."""
+        if len(nids) == 1:
+            return nids[0]
+        for narrowed in (
+            [n for n in nids if self.same(self.file(n), from_file)],
+            [n for n in nids if self.same_crate(self.file(n), from_file)],
+        ):
+            if len(narrowed) == 1:
+                return narrowed[0]
+        return None
+
+    def type_decl(self, name: str | None, from_file: str) -> tuple[str, str] | None:
+        """(type name, file of its declaration) for a type named from ``from_file``."""
+        if not name:
+            return None
+        decl = self.pick(self.declared_by_type.get(name, []), from_file)
+        return (name, self.file(decl)) if decl else None
+
+    def method(self, owner: tuple[str, str], name: str) -> str | None:
+        """The one method ``name`` across the impl blocks of ``owner`` in its crate."""
+        type_name, decl_file = owner
+        found: set[str] = set()
+        for nid in self.owners_by_type.get(type_name, []):
+            if self.same_crate(self.file(nid), decl_file):
+                found |= self.methods_by_owner.get((nid, name), set())
+        return next(iter(found)) if len(found) == 1 else None
+
+
 def _resolve_rust_typed_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -7536,111 +7713,14 @@ def _resolve_rust_typed_member_calls(
     ]
     if not raw:
         return
-    from graphify.extractors.rust import _rust_type_last_segment
-
-    node_by_id: dict[str, dict] = {str(n.get("id")): n for n in all_nodes if n.get("id")}
-    contains_targets = {e.get("target") for e in all_edges if e.get("relation") == "contains"}
-    owners_by_type: dict[str, list[str]] = {}
-    declared_by_type: dict[str, list[str]] = {}
-    free_fns: dict[str, list[str]] = {}
-    for n in all_nodes:
-        source_file = str(n.get("source_file") or "")
-        if not source_file.endswith(".rs"):
-            continue
-        label, nid = str(n.get("label") or ""), str(n.get("id") or "")
-        if not nid:
-            continue
-        if label.endswith(")"):
-            if not label.startswith(".") and nid in contains_targets:
-                free_fns.setdefault(label[:-2], []).append(nid)
-            continue
-        bare = _rust_type_last_segment(label)
-        if bare[:1].isupper():
-            owners_by_type.setdefault(bare, []).append(nid)
-            if nid in contains_targets and n.get("_rust_declaration_count"):
-                declared_by_type.setdefault(bare, []).append(nid)
-
-    methods_by_owner: dict[tuple[str, str], set[str]] = {}
-    for e in all_edges:
-        if e.get("relation") != "method":
-            continue
-        src, tgt = str(e.get("source") or ""), str(e.get("target") or "")
-        tnode = node_by_id.get(tgt)
-        if src and tnode is not None:
-            name = str(tnode.get("label", "")).strip("()").lstrip(".")
-            methods_by_owner.setdefault((src, name), set()).add(tgt)
-
-    def _file(nid: str) -> str:
-        return str(node_by_id.get(nid, {}).get("source_file") or "").replace("\\", "/")
-
-    # On a changed-files rebuild the unchanged corpus comes back from graph.json
-    # with root-relative paths while re-extracted files carry absolute ones, so
-    # two paths match when equal or when the absolute one ends with the other.
-    def _is_abs(path: str) -> bool:
-        return path.startswith("/") or bool(re.match(r"^[A-Za-z]:/", path))
-
-    # A file belongs to the deepest crate root above it, so a `tests` module in
-    # `src/` and a crate's own `tests/`, `benches/` and `examples/` stay with
-    # their crate, and a checkout that itself sits under a `src` folder does not
-    # merge every crate into one.
-    rust_paths = {f for f in (_file(nid) for nid in node_by_id) if f.endswith(".rs")}
-    rust_paths |= {str(rc.get("source_file", "")).replace("\\", "/") for rc in raw}
-    crate_roots = _rust_crate_roots(rust_paths)
-    crate_of: dict[str, str] = {}
-
-    def _crate(path: str) -> str:
-        if path not in crate_of:
-            best: str | None = None
-            for root in crate_roots:
-                inside = path.startswith(root + "/") if root else not _is_abs(path)
-                if inside and (best is None or len(root) > len(best)):
-                    best = root
-            crate_of[path] = best if best is not None else path.rsplit("/", 1)[0] if "/" in path else ""
-        return crate_of[path]
-
-    relative_crates = {c for c in crate_roots if c and not _is_abs(c)}
-    corpus_crates = _rust_corpus_crate_names(rust_paths, crate_roots)
-
-    def _same(a: str, b: str, crate: bool = False) -> bool:
-        if a == b:
-            return True
-        if _is_abs(a) == _is_abs(b):
-            return False
-        absolute, relative = (a, b) if _is_abs(a) else (b, a)
-        if relative:
-            return absolute.endswith("/" + relative)
-        # the root crate (`src/` at the repo root): no other crate's dir ends it
-        return crate and not any(absolute.endswith("/" + c) for c in relative_crates)
-
-    def _same_crate(a: str, b: str) -> bool:
-        return _same(_crate(a), _crate(b), crate=True)
-
-    def _pick(nids: list[str], from_file: str) -> str | None:
-        # One definition, or the one in the caller's file, or in its crate.
-        if len(nids) == 1:
-            return nids[0]
-        for narrowed in (
-            [n for n in nids if _same(_file(n), from_file)],
-            [n for n in nids if _same_crate(_file(n), from_file)],
-        ):
-            if len(narrowed) == 1:
-                return narrowed[0]
-        return None
-
-    def _type(name: str | None, from_file: str) -> tuple[str, str] | None:
-        # (type name, file of its declaration)
-        if not name:
-            return None
-        decl = _pick(declared_by_type.get(name, []), from_file)
-        return (name, _file(decl)) if decl else None
-
-    def _method(owner: tuple[str, str], name: str) -> str | None:
-        type_name, decl_file = owner
-        found: set[str] = set()
-        for nid in owners_by_type.get(type_name, []):
-            if _same_crate(_file(nid), decl_file):
-                found |= methods_by_owner.get((nid, name), set())
-        return next(iter(found)) if len(found) == 1 else None
+    corpus = _RustCorpusIndex(all_nodes, all_edges, raw)
+    node_by_id = corpus.node_by_id
+    declared_by_type = corpus.declared_by_type
+    free_fns = corpus.free_fns
+    _file, _same, _pick, _type, _method = (
+        corpus.file, corpus.same, corpus.pick, corpus.type_decl, corpus.method,
+    )
+    corpus_crates = corpus.corpus_crates
 
     def _returns(fn_nid: str | None, want_ok: bool) -> tuple[str, str] | None:
         if fn_nid is None:
@@ -7697,6 +7777,136 @@ def _resolve_rust_typed_member_calls(
             "confidence": "INFERRED",
             "confidence_score": 0.85,
             "source_file": source_file,
+            "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+
+
+def _resolve_rust_scoped_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve cross-file Rust `Type::f()` and `module::f()` calls.
+
+    rust.py hands each qualified call it cannot bind in-file over with its
+    qualifier path (`rust_path`), with the first segment replaced by the path a
+    `use` bound it to (`use crate::util; util::f()` -> crate::util). The path
+    names a crate and a module in it: `crate::`, `self::` and `super::` are the
+    caller's crate relative to its module, a corpus crate's name is that crate,
+    and any other first segment is a child module of the caller's module.
+
+    `module::f()` binds to the one free function `f` whose file and inline
+    `mod` path are that module, as EXTRACTED: the path is written in the source.
+    `Type::f()` binds to the one method `f` across the type's impl blocks in
+    its crate, the type picked by name in the crate (narrowed by module when the
+    path names one), as INFERRED. A path into `std`, `core`, `alloc` or a crate
+    outside the corpus, or any step that is not unique, gives no edge.
+    """
+    raw = [
+        rc
+        for result in per_file
+        for rc in result.get("raw_calls", [])
+        if rc.get("rust_path") and rc.get("callee") and rc.get("caller_nid")
+    ]
+    if not raw:
+        return
+    corpus = _RustCorpusIndex(all_nodes, all_edges, raw)
+
+    fns_by_module: dict[tuple[str, tuple[str, ...]], list[str]] = {}
+    for name, nids in corpus.free_fns.items():
+        for nid in nids:
+            fns_by_module.setdefault((name, corpus.module_path(nid)), []).append(nid)
+    # Every module (and each of its ancestors) that holds a Rust node, by crate.
+    module_prefixes: dict[str, set[tuple[str, ...]]] = {}
+    for nid in corpus.node_by_id:
+        rust_file = corpus.file(nid)
+        if rust_file.endswith(".rs"):
+            module = corpus.module_path(nid)
+            prefixes = module_prefixes.setdefault(corpus.crate(rust_file), set())
+            prefixes.update(module[:i] for i in range(1, len(module) + 1))
+
+    def _target_module(path: list[str], caller: str, caller_file: str) -> tuple[str, list[str]] | None:
+        # (crate root, module path) the qualifier names, or None outside the corpus.
+        caller_crate = corpus.crate(caller_file)
+        caller_mod = list(corpus.module_path(caller))
+        head = path[0]
+        if head in ("std", "core", "alloc", "::"):
+            return None
+        if head == "crate":
+            return caller_crate, path[1:]
+        if head == "self":
+            return caller_crate, caller_mod + path[1:]
+        if head == "super":
+            ups = 0
+            while ups < len(path) and path[ups] == "super":
+                ups += 1
+            if ups > len(caller_mod):
+                return None
+            return caller_crate, caller_mod[:len(caller_mod) - ups] + path[ups:]
+        roots = corpus.roots_by_crate_name.get(head, set())
+        if len(roots) == 1:
+            return next(iter(roots)), path[1:]
+        if roots:
+            return None
+        child = tuple(caller_mod + path)
+        local_child = any(
+            child in prefixes and corpus.same(crate_root, caller_crate, crate=True)
+            for crate_root, prefixes in module_prefixes.items()
+        )
+        return (caller_crate, list(child)) if local_child else None
+
+    existing_pairs = {
+        (e.get("source"), e.get("target")) for e in all_edges if e.get("relation") == "calls"
+    }
+    for rc in raw:
+        caller = str(rc["caller_nid"])
+        callee = str(rc["callee"])
+        path = [str(p) for p in rc["rust_path"]]
+        caller_file = corpus.file(caller) or str(rc.get("source_file", "")).replace("\\", "/")
+        tgt: str | None = None
+        confidence, score = "EXTRACTED", 1.0
+        if rc.get("rust_type_call"):
+            type_name = path[-1]
+            declared = corpus.declared_by_type.get(type_name, [])
+            if len(path) == 1:
+                # `Foo::f()` with `Foo` in scope (declared or glob-imported): the
+                # caller's own file, else the one `Foo` of the caller's crate.
+                owner = corpus.type_decl(type_name, caller_file)
+                if owner is not None and not corpus.same_crate(owner[1], caller_file):
+                    owner = None
+            else:
+                where = _target_module(path[:-1], caller, caller_file)
+                owner = None
+                if where is not None:
+                    crate_root, module = where
+                    in_crate = [d for d in declared if corpus.in_crate(corpus.file(d), crate_root)]
+                    exact = [d for d in in_crate if list(corpus.module_path(d)) == module]
+                    pool = exact or in_crate
+                    if len(pool) == 1:
+                        owner = (type_name, corpus.file(pool[0]))
+            tgt = corpus.method(owner, callee) if owner else None
+            confidence, score = "INFERRED", 0.85
+        else:
+            where = _target_module(path, caller, caller_file)
+            if where is not None:
+                crate_root, module = where
+                found = [
+                    n for n in fns_by_module.get((callee, tuple(module)), [])
+                    if corpus.in_crate(corpus.file(n), crate_root)
+                ]
+                tgt = found[0] if len(found) == 1 else None
+        if tgt is None or tgt == caller or (caller, tgt) in existing_pairs:
+            continue
+        existing_pairs.add((caller, tgt))
+        all_edges.append({
+            "source": caller,
+            "target": tgt,
+            "relation": "calls",
+            "context": "call",
+            "confidence": confidence,
+            "confidence_score": score,
+            "source_file": rc.get("source_file", ""),
             "source_location": rc.get("source_location"),
             "weight": 1.0,
         })
@@ -8000,6 +8210,9 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("rust_typed_member_calls", frozenset({".rs"}), _resolve_rust_typed_member_calls)
+)
+register_language_resolver(
+    LanguageResolver("rust_scoped_calls", frozenset({".rs"}), _resolve_rust_scoped_calls)
 )
 register_language_resolver(
     LanguageResolver("vbnet_partial_calls", frozenset({".vb"}), resolve_vbnet_partial_calls)
@@ -11050,6 +11263,11 @@ def extract(
         # Skip member-call callees: obj.log() → "log" has no import evidence
         # and collides with any top-level function named "log" in the corpus.
         if rc.get("is_member_call"):
+            continue
+        # A Rust `Type::f()` / `module::f()` names where `f` lives;
+        # _resolve_rust_scoped_calls binds it through that path, never by the
+        # bare last segment (#908).
+        if rc.get("rust_path"):
             continue
         # Skip Ruby include/extend/prepend mixin markers: they carry a module
         # name as `callee` but are not calls — the Ruby resolver turns them into

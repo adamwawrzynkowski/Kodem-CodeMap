@@ -322,6 +322,104 @@ def _rust_foreign_imports(scope, source: bytes) -> dict[str, str]:
     return names
 
 
+def _rust_path_segments(text: str) -> list[str]:
+    """`crate::a::Foo::<T>` -> ["crate", "a", "Foo"]: the segments of a path as
+    written, generic arguments dropped. A leading `::` (an extern-crate path) is
+    kept as its own "::" segment."""
+    depth, kept = 0, []
+    for ch in text.strip():
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth = max(depth - 1, 0)
+        elif depth == 0:
+            kept.append(ch)
+    joined = "".join(kept)
+    segments = [s.strip() for s in joined.split("::") if s.strip()]
+    return (["::"] + segments) if joined.lstrip().startswith("::") else segments
+
+
+_USE_PATHS: dict[tuple[int, int], dict[str, list[str]]] = {}
+_USE_PATHS_SOURCE: list[bytes | None] = [None]
+
+
+def _rust_use_paths(scope, source: bytes) -> dict[str, list[str]]:
+    """Each name the module ``scope`` (a file root or a `mod` item) binds with a
+    `use`, mapped to the path it names: `use crate::a::util;` gives
+    {"util": ["crate", "a", "util"]}, `use a::{B as C}` gives {"C": ["a", "B"]}.
+    Globs bind no name. Nested `mod` items are not read: a `use` applies to its
+    own module only."""
+    if _USE_PATHS_SOURCE[0] is not source:
+        _USE_PATHS.clear()
+        _USE_PATHS_SOURCE[0] = source
+    key = (scope.start_byte, scope.end_byte)
+    cached = _USE_PATHS.get(key)
+    if cached is not None:
+        return cached
+    paths: dict[str, list[str]] = {}
+    stack = list(scope.children)
+    while stack:
+        n = stack.pop()
+        if n.type == "mod_item":
+            continue
+        if n.type == "use_declaration":
+            arg = n.child_by_field_name("argument")
+            for binding, _line in _rust_use_bindings(arg, source) if arg is not None else ():
+                written, _, alias = binding.partition(" as ")
+                segments = _rust_path_segments(written)
+                if not segments or segments[-1] == "*":
+                    continue
+                bound = alias.strip() or segments[-1]
+                if bound.isidentifier() and bound != "_":
+                    paths[bound] = segments
+            continue
+        stack.extend(n.children)
+    _USE_PATHS[key] = paths
+    return paths
+
+
+def _rust_in_file_module_path(path: list[str] | None, node, inline_mods: frozenset[str]) -> bool:
+    """Whether a module-qualified call `path::f()` names this file's own items:
+    `self::f()`, `super::f()` from code inside an inline `mod` block (its parent
+    module is this file), or `inner::f()` into an inline `mod inner { .. }`."""
+    if not path:
+        return False
+    if path == ["self"]:
+        return True
+    if path == ["super"]:
+        enclosing = _rust_scope(node)
+        return enclosing is not None and enclosing.type == "mod_item"
+    return path[0] in inline_mods
+
+
+def _rust_scoped_path_may_be_local(path: list[str], qualifier_type: str | None,
+                                   local_types: set[str]) -> bool:
+    """Whether a `Type::f()` / `module::f()` path can name this corpus's own
+    item: a path into `std` / `core` / `alloc` or an extern `::crate` cannot,
+    nor can a std type such as `Arc::new` or `Vec::with_capacity` that the file
+    does not shadow."""
+    head = path[0]
+    if head in ("std", "core", "alloc", "::"):
+        return False
+    if qualifier_type is not None and len(path) == 1:
+        return bool(qualifier_type) and (
+            qualifier_type not in _RUST_BUILTIN_TYPES or qualifier_type in local_types
+        ) and qualifier_type not in _RUST_PRIMITIVE_TYPES
+    return True
+
+
+def _rust_inline_mods(root) -> list:
+    """Every inline `mod name { .. }` item under ``root`` (not `mod name;`)."""
+    found = []
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if n.type == "mod_item" and n.child_by_field_name("body") is not None:
+            found.append(n)
+        stack.extend(n.children)
+    return found
+
+
 def _rust_scope(node):
     """The module a node sits in: its nearest `mod` item, else the file root."""
     while node is not None:
@@ -1239,6 +1337,14 @@ def extract_rust(path: Path) -> dict:
     # newtype used everywhere (`ClientId(id)`) reads as a top call hub.
     type_nids: set[str] = {n["id"] for n in nodes if not n["label"].endswith(")")}
 
+    # Names of the inline `mod name { .. }` blocks in this file: a call
+    # `name::f()` into one of them stays an in-file call.
+    inline_mod_names: frozenset[str] = frozenset(
+        _read_text(name_node, source)
+        for mod_node in _rust_inline_mods(root)
+        if (name_node := mod_node.child_by_field_name("name")) is not None
+    )
+
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
 
@@ -1286,6 +1392,7 @@ def extract_rust(path: Path) -> dict:
             is_scoped_call: bool = False
             is_self_call: bool = False
             qualifier_type: str | None = None
+            scoped_path: list[str] | None = None
             receiver_desc: dict | None = None
             if func_node:
                 if func_node.type == "identifier":
@@ -1303,18 +1410,30 @@ def extract_rust(path: Path) -> dict:
                         # type is found, for the corpus pass to evaluate.
                         receiver_desc = typer.describe(receiver)
                 elif func_node.type == "scoped_identifier":
-                    # Type::method() — still allow in-file EXTRACTED match, but
-                    # skip cross-file resolution: bare last-segment lookup ignores
-                    # crate boundaries and produces spurious INFERRED edges (#908).
+                    # `Type::f()` / `module::f()`: bound in-file when the file
+                    # holds the target, else handed to the corpus pass with the
+                    # qualifier path, never resolved by its bare last segment
+                    # (that ignored crate boundaries, #908).
                     is_scoped_call = True
                     name = func_node.child_by_field_name("name")
                     if name:
                         callee_name = _read_text(name, source)
-                    qualifier_type = _rust_qualifier_type(func_node.child_by_field_name("path"), source)
+                    path_node = func_node.child_by_field_name("path")
+                    qualifier_type = _rust_qualifier_type(path_node, source)
                     if qualifier_type == "Self":
                         # A trait's default method has no impl type: "" matches
                         # no method, so `Self::f()` there binds nothing in-file.
                         qualifier_type = self_type or ""
+                        scoped_path = [qualifier_type] if qualifier_type else None
+                    elif path_node is not None and path_node.type in (
+                        "identifier", "scoped_identifier", "crate", "self", "super", "generic_type",
+                    ):
+                        scoped_path = _rust_path_segments(_read_text(path_node, source))
+                        if scoped_path and scoped_path[0] not in ("crate", "self", "super", "::"):
+                            scope = _rust_scope(node)
+                            bound = _rust_use_paths(scope, source).get(scoped_path[0]) if scope is not None else None
+                            if bound:
+                                scoped_path = bound + scoped_path[1:]
             if (
                 callee_name
                 and callee_name not in _LANGUAGE_BUILTIN_GLOBALS
@@ -1332,6 +1451,11 @@ def extract_rust(path: Path) -> dict:
                         # `Enum::Variant(x)` constructs a value: the variant node.
                         named = label_to_nid.get(callee_name)
                         tgt_nid = named if named in type_nids else None
+                elif is_scoped_call and not _rust_in_file_module_path(scoped_path, node, inline_mod_names):
+                    # `util::f()` / `crate::f()` names a module, which is another
+                    # file unless the path is `self::` or an inline `mod` here:
+                    # the bare name `f` in this file is the wrong function.
+                    tgt_nid = None
                 elif is_member_call and not is_self_call:
                     # `x.m()` binds by the receiver's type in the corpus pass, or
                     # not at all: by bare name it reached whichever `m` the file
@@ -1371,7 +1495,18 @@ def extract_rust(path: Path) -> dict:
                         "source_file": str_path,
                         "source_location": f"L{node.start_point[0] + 1}",
                     })
-                elif not is_scoped_call and callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST:
+                elif is_scoped_call:
+                    if scoped_path and _rust_scoped_path_may_be_local(scoped_path, qualifier_type, local_types):
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": callee_name,
+                            "is_member_call": False,
+                            "rust_path": scoped_path,
+                            "rust_type_call": qualifier_type is not None,
+                            "source_file": str_path,
+                            "source_location": f"L{node.start_point[0] + 1}",
+                        })
+                elif callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST:
                     rc_entry = {
                         "caller_nid": caller_nid,
                         "callee": callee_name,
