@@ -4,3 +4,7 @@
 worked/**/*.html linguist-vendored=true
 graphify-out/**/*.html linguist-vendored=true
 *.html linguist-detectable=false
+# Modified by Kodem.
+# The viewer embeds vis-network only when its bytes match upstream's integrity hash, so a
+# checkout must never change their line endings.
+graphify/kodem_assets/** -text
