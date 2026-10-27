@@ -59,6 +59,9 @@ Server name `kodem-codemap`. Tools: `query_graph`, `get_node`, `get_neighbors`, 
 | Kodem MCP mode (`GRAPHIFY_KODEM_MCP=1`): server `kodem-codemap` with instructions; 4 tools with short schemas and no `project_path` (about 400 tokens instead of 1,600); answers grouped by file with empty fields left out; default depth 2 and budget 1,200; trailing edges cut to the budget. On the Kodem map the average answer fell from about 2,160 to about 1,340 tokens | #4469, #2784 | `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_mcp.py` |
 | CI for the fork: contract tests on macOS, Windows and Linux, the upstream suite on Linux with the base's known failures deselected; upstream publish, release-graph, welcome and PR-management workflows removed; Dependabot for pinned actions | — | `.github/`, `tests/kodem_known_failures.txt` |
 | Runtime archive build (`scripts/kodem/build_runtime.py`) and the draft-release workflow | — | `scripts/kodem/`, `.github/workflows/runtime.yml` |
+| Rust accuracy: typed receivers (port of PR #4299), cross-file `Type::f()` and `module::f()`, Rust-only builtin gates, mod-path IDs with visibility and `cfg(test)` metadata and filters, trait names in impl method IDs, trait dispatch, no pooling of same-named types, ambiguous bare calls bound through `use`. On kodem-ade: Rust `calls` edges 11,643 → 15,455, and 15 sampled edges 10 → 14 correct | #4296, #2135, #2313, #2774, #4285, #2041 | `graphify/extractors/rust.py`, `graphify/extract.py`, `graphify/rust_dispatch.py`, `graphify/cache.py`, `tests/test_rust_*.py` |
+| C# and Unity: C#-only builtin gate, attributes on every declaration with `typeof(X)` and the `Attribute` suffix, member marker for the type index, Unity generated folders skipped, Unity/DOTS entry points and `schedules` edges from jobs to `Execute` | #2313, #3212 | `graphify/extractors/`, `graphify/extract.py`, `graphify/detect.py`, `tests/test_csharp_*.py`, `tests/test_unity_project_excludes.py` |
+| A failing language resolver stops the run (`GRAPHIFY_LENIENT_RESOLVERS=1` restores upstream's warning) | #3667 | `graphify/resolver_registry.py` |
 
 ## Known gaps
 
@@ -71,3 +74,4 @@ These upstream issues still apply to the runtime. Kodem works around them where 
 | #3868 | A crafted corpus can create millions of import edges | — |
 | #3810 | `query_graph` can seed on one common word of the question | — |
 | #4738, #4281, #3726, #3407 | Node-ID collisions drop nodes; graphify prints a note | — |
+| — | Rust: inherent and trait-impl methods of one type are pooled by name, and trait default methods are not candidates; glob `use x::*`, re-export chains, `#[path]` and `f::<T>()` are not resolved; the visibility of an enclosing mod is ignored | — |
