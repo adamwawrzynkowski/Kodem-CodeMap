@@ -1,0 +1,8 @@
+# Tests that fail on the upstream base (graphify 0.9.96, dac0634) before any fork change.
+# CI deselects them; remove a line when the test passes again.
+tests/test_ext_tagged_id_clash.py::test_a_swift_type_named_like_the_sibling_extension_keeps_both_file_nodes
+tests/test_ext_tagged_id_clash.py::test_controls_with_a_sibling_keep_todays_ids
+tests/test_ext_tagged_id_clash.py::test_edges_follow_the_right_node_when_x_mjs_also_imports_x_sql
+tests/test_ext_tagged_id_clash.py::test_the_file_node_is_still_found_by_label_after_build
+tests/test_ext_tagged_id_clash.py::test_variable_named_like_the_sibling_extension_keeps_its_own_node
+tests/test_skill_no_backtick_substitution.py::test_control_a_backticked_unknown_command_is_caught

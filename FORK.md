@@ -57,3 +57,17 @@ Server name `kodem-codemap`. Tools: `query_graph`, `get_node`, `get_neighbors`, 
 | Kodem entry point `graphify.kodem_main`: build, update, html, serve, version; no LLM, no network, writes only to `--out`; build and update share the update pipeline | #3300, #4361, #4624 | `graphify/kodem_main.py`, `pyproject.toml`, `tests/test_kodem_main.py` |
 | `GRAPHIFY_NO_VIZ=1`: updates never write `graph.html` or its stale marker, and the no-change gate ignores the page | — | `graphify/watch.py` |
 | Kodem MCP mode (`GRAPHIFY_KODEM_MCP=1`): server `kodem-codemap` with instructions; 4 tools with short schemas and no `project_path` (about 400 tokens instead of 1,600); answers grouped by file with empty fields left out; default depth 2 and budget 1,200; trailing edges cut to the budget. On the Kodem map the average answer fell from about 2,160 to about 1,340 tokens | #4469, #2784 | `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_mcp.py` |
+| CI for the fork: contract tests on macOS, Windows and Linux, the upstream suite on Linux with the base's known failures deselected; upstream publish, release-graph, welcome and PR-management workflows removed; Dependabot for pinned actions | — | `.github/`, `tests/kodem_known_failures.txt` |
+| Runtime archive build (`scripts/kodem/build_runtime.py`) and the draft-release workflow | — | `scripts/kodem/`, `.github/workflows/runtime.yml` |
+
+## Known gaps
+
+These upstream issues still apply to the runtime. Kodem works around them where noted.
+
+| Issue | Effect | Kodem |
+| --- | --- | --- |
+| #4800 | Any change re-extracts all files (the AST cache keeps it at about 10 s on the Kodem repository; a no-change update takes under 1 s) | Updates run in the background after a turn |
+| #3646 | On Windows, `update` can hang while it saves the manifest | Kodem stops map jobs that run too long |
+| #3868 | A crafted corpus can create millions of import edges | — |
+| #3810 | `query_graph` can seed on one common word of the question | — |
+| #4738, #4281, #3726, #3407 | Node-ID collisions drop nodes; graphify prints a note | — |

@@ -1,0 +1,9 @@
+# Modified by Kodem.
+# Keeps the pinned commits of the workflows' actions current. Python dependencies (uv.lock) are
+# updated by hand, because each change needs a license review (scripts/kodem/build_runtime.py).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
