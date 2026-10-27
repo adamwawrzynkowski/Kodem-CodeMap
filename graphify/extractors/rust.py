@@ -424,6 +424,23 @@ def _rust_inline_mods(root) -> list:
     return found
 
 
+def _rust_is_test_attribute(text: str) -> bool:
+    """Whether an attribute's text marks test-only code: `#[cfg(test)]`,
+    `#![cfg(test)]`, `#[test]` or a runner's `#[tokio::test]`."""
+    body = re.sub(r"\s+", "", text).lstrip("#!").strip("[]")
+    return bool(re.fullmatch(r"cfg\(test\)|(?:\w+::)*test", body))
+
+
+def _rust_has_test_attribute(item, source: bytes) -> bool:
+    """Whether one of the attributes right before ``item`` marks it test-only."""
+    sibling = item.prev_named_sibling
+    while sibling is not None and sibling.type in ("attribute_item", "line_comment", "block_comment"):
+        if sibling.type == "attribute_item" and _rust_is_test_attribute(_read_text(sibling, source)):
+            return True
+        sibling = sibling.prev_named_sibling
+    return False
+
+
 def _rust_scope(node):
     """The module a node sits in: its nearest `mod` item, else the file root."""
     while node is not None:
@@ -730,7 +747,7 @@ def extract_rust(path: Path) -> dict:
     nodes: list[dict] = []
     edges: list[dict] = []
     seen_ids: set[str] = set()
-    function_bodies: list[tuple[str, object, str | None, str | None]] = []
+    function_bodies: list[tuple[str, object, str | None, str | None, tuple[str, ...]]] = []
     impl_keys: dict[str, str | None] = {}
 
     # Names this file defines as a type (struct/enum/trait/union/alias) before it
@@ -771,9 +788,13 @@ def extract_rust(path: Path) -> dict:
     # (once per declaration, that scan was quadratic in the file's size).
     node_by_id: dict[str, dict] = {}
 
+    # Inline `mod` path of each node, when walk() made it (see mod_stack below).
+    nid_mods: dict[str, tuple[str, ...]] = {}
+
     def add_node(nid: str, label: str, line: int) -> None:
         if nid not in seen_ids:
             seen_ids.add(nid)
+            nid_mods[nid] = mod_stack[-1]
             node_by_id[nid] = {
                 "id": nid,
                 "label": label,
@@ -799,6 +820,8 @@ def extract_rust(path: Path) -> dict:
             edge["context"] = context
         edges.append(edge)
 
+    # The inline `mod` blocks around the item walk() is at (see walk()).
+    mod_stack: list[tuple[str, ...]] = [()]
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
@@ -822,7 +845,7 @@ def extract_rust(path: Path) -> dict:
     items_by_id: dict[str, set[tuple[bool, str]]] = {}
     declared_type_names: dict[str, set[str]] = {}
 
-    def _scan_type_items(node) -> None:
+    def _scan_type_items(node, mods: tuple[str, ...] = ()) -> None:
         t = node.type
         if t in ("struct_item", "enum_item", "trait_item", "union_item", "type_item",
                  "function_item", "function_signature_item", "static_item", "const_item"):
@@ -831,11 +854,12 @@ def extract_rust(path: Path) -> dict:
                 name = _read_text(name_node, source)
                 if t in ("static_item", "const_item") and name == "_":
                     return
-                nid = _make_id(stem, name)
+                nid = _make_id(stem, *mods, name)
                 is_type = t in ("struct_item", "enum_item", "trait_item", "union_item", "type_item")
                 items_by_id.setdefault(nid, set()).add((is_type, name))
                 if is_type:
                     declared_type_names.setdefault(nid, set()).add(name)
+                    declared_type_mods.add((mods, name))
             return
         if t == "impl_item":
             type_node = node.child_by_field_name("type")
@@ -844,15 +868,24 @@ def extract_rust(path: Path) -> dict:
                 refs: list[tuple[str, str]] = []
                 _rust_collect_type_refs(type_node, source, False, refs)
                 bare = next((ref for ref, role in refs if role == "type"), type_name)
-                items_by_id.setdefault(_make_id(stem, type_name), set()).add((True, bare))
+                items_by_id.setdefault(_make_id(stem, *mods, type_name), set()).add((True, bare))
                 impl_bare_names[node.start_byte] = bare
             return
         if t == "use_declaration":
             return
+        if t == "mod_item":
+            name_node, body = node.child_by_field_name("name"), node.child_by_field_name("body")
+            if name_node is not None and body is not None:
+                for child in body.children:
+                    _scan_type_items(child, mods + (_read_text(name_node, source),))
+            return
         for child in node.children:
-            _scan_type_items(child)
+            _scan_type_items(child, mods)
 
     impl_bare_names: dict[int, str] = {}
+    # (inline mod path, name) of each declared type, so a type named inside a
+    # `mod` block resolves to that block's declaration first.
+    declared_type_mods: set[tuple[tuple[str, ...], str]] = set()
     _scan_type_items(root)
     local_type_names = frozenset(
         name
@@ -881,8 +914,20 @@ def extract_rust(path: Path) -> dict:
         return _make_id(plain_nid, salt)
 
     def ensure_named_node(name: str, line: int) -> str:
+        mods = mod_stack[-1]
+        for depth in range(len(mods), -1, -1):
+            nid = file_item_nid(_make_id(stem, *mods[:depth], name), name)
+            if nid in seen_ids or (
+                name in local_type_names and (mods[:depth], name) in declared_type_mods
+            ):
+                return nid
+        # Declared in another `mod` block of this file only (`use inner::Sink;`
+        # at the top, `mod inner { pub struct Sink; }` below): that declaration.
+        declared_in = [m for m, declared in declared_type_mods if declared == name]
+        if len(declared_in) == 1 and declared_in[0] and name in local_type_names:
+            return file_item_nid(_make_id(stem, *declared_in[0], name), name)
         nid = file_item_nid(_make_id(stem, name), name)
-        if nid in seen_ids or name in local_type_names:
+        if name in local_type_names:
             return nid
         nid = _make_id(name)
         if nid not in seen_ids:
@@ -929,13 +974,56 @@ def extract_rust(path: Path) -> dict:
                 if tgt != func_nid:
                     add_edge(func_nid, tgt, "references", line, context=ctx)
 
+    # Whether the inline `mod` blocks around the item walk() is at (or the file,
+    # `#![cfg(test)]`) are test-only.
+    test_stack: list[bool] = [any(
+        child.type == "inner_attribute_item" and _rust_is_test_attribute(_read_text(child, source))
+        for child in root.children
+    )]
+
+    def item_id(name: str) -> str:
+        """The plain id of a file-level item named ``name`` in the current mod."""
+        return _make_id(stem, *mod_stack[-1], name)
+
+    def tag_item(nid: str, item, public: bool = False) -> None:
+        """Record the item's inline mod path, visibility and test-only scope."""
+        item_node = node_by_id.get(nid)
+        if item_node is None:
+            return
+        if mod_stack[-1]:
+            item_node["_rust_mod_path"] = "::".join(mod_stack[-1])
+        vis = next((c for c in item.children if c.type == "visibility_modifier"), None)
+        item_node["_rust_vis"] = "pub" if public else (
+            re.sub(r"\s+", "", _read_text(vis, source)) if vis is not None else "priv"
+        )
+        if test_stack[-1] or _rust_has_test_attribute(item, source):
+            item_node["_rust_cfg_test"] = True
+
     def walk(
         node,
         parent_impl_nid: str | None = None,
         parent_impl_type: str | None = None,
         parent_impl_key: str | None = None,
+        parent_is_trait: bool = False,
     ) -> None:
         t = node.type
+
+        if t == "mod_item":
+            # `mod name { .. }`: its items get the mod path in their ids, so a
+            # `mod tests { fn helper }` beside a top-level `helper` is its own
+            # node (#2774). `mod name;` names another file, which is walked
+            # on its own.
+            name_node, body = node.child_by_field_name("name"), node.child_by_field_name("body")
+            if name_node is not None and body is not None:
+                mod_stack.append(mod_stack[-1] + (_read_text(name_node, source),))
+                test_stack.append(test_stack[-1] or _rust_has_test_attribute(node, source))
+                try:
+                    for child in body.children:
+                        walk(child)
+                finally:
+                    mod_stack.pop()
+                    test_stack.pop()
+            return
 
         if t == "function_item":
             name_node = node.child_by_field_name("name")
@@ -948,11 +1036,12 @@ def extract_rust(path: Path) -> dict:
                     add_edge(parent_impl_nid, func_nid, "method", line)
                     if parent_impl_type:
                         owner = _rust_type_last_segment(parent_impl_type)
-                        impl_methods.setdefault((owner, func_name), set()).add(func_nid)
+                        impl_methods.setdefault((mod_stack[-1], owner, func_name), set()).add(func_nid)
                 else:
-                    func_nid = file_item_nid(_make_id(stem, func_name), func_name)
+                    func_nid = file_item_nid(item_id(func_name), func_name)
                     add_node(func_nid, f"{func_name}()", line)
                     add_edge(file_nid, func_nid, "contains", line)
+                tag_item(func_nid, node, public=parent_is_trait)
                 emit_param_return_refs(node, func_nid, line)
                 ret, ret_ok = _rust_return_types(node, source, parent_impl_type)
                 if ret or ret_ok:
@@ -968,6 +1057,7 @@ def extract_rust(path: Path) -> dict:
                         body,
                         parent_impl_type,
                         parent_impl_key,
+                        mod_stack[-1],
                     ))
             return
 
@@ -986,9 +1076,10 @@ def extract_rust(path: Path) -> dict:
                     add_node(func_nid, f".{func_name}()", line)
                     add_edge(parent_impl_nid, func_nid, "method", line)
                 else:
-                    func_nid = file_item_nid(_make_id(stem, func_name), func_name)
+                    func_nid = file_item_nid(item_id(func_name), func_name)
                     add_node(func_nid, f"{func_name}()", line)
                     add_edge(file_nid, func_nid, "contains", line)
+                tag_item(func_nid, node, public=parent_is_trait)
                 emit_param_return_refs(node, func_nid, line)
             return
 
@@ -1020,8 +1111,9 @@ def extract_rust(path: Path) -> dict:
             if name_node:
                 item_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
-                item_nid = file_item_nid(_make_id(stem, item_name), item_name)
+                item_nid = file_item_nid(item_id(item_name), item_name)
                 add_node(item_nid, item_name, line)
+                tag_item(item_nid, node)
                 declaration_node = node_by_id[item_nid]
                 declaration_node["_rust_declaration_count"] = (
                     declaration_node.get("_rust_declaration_count", 0) + 1
@@ -1165,7 +1257,7 @@ def extract_rust(path: Path) -> dict:
                     body = node.child_by_field_name("body")
                     if body:
                         for child in body.children:
-                            walk(child, parent_impl_nid=item_nid)
+                            walk(child, parent_impl_nid=item_nid, parent_is_trait=True)
             return
 
         if t in ("static_item", "const_item"):
@@ -1184,9 +1276,10 @@ def extract_rust(path: Path) -> dict:
                     add_node(item_nid, f".{item_name}", line)
                     add_edge(parent_impl_nid, item_nid, "contains", line)
                 else:
-                    item_nid = file_item_nid(_make_id(stem, item_name), item_name)
+                    item_nid = file_item_nid(item_id(item_name), item_name)
                     add_node(item_nid, item_name, line)
                     add_edge(file_nid, item_nid, "contains", line)
+                tag_item(item_nid, node)
                 type_node = node.child_by_field_name("type")
                 if type_node is not None:
                     refs: list[tuple[str, str]] = []
@@ -1208,7 +1301,7 @@ def extract_rust(path: Path) -> dict:
             if type_node:
                 type_name = _read_text(type_node, source).strip()
                 impl_nid = file_item_nid(
-                    _make_id(stem, type_name), impl_bare_names.get(node.start_byte, type_name)
+                    item_id(type_name), impl_bare_names.get(node.start_byte, type_name)
                 )
                 add_node(impl_nid, type_name, node.start_point[0] + 1)
                 impl_key = _rust_simple_generic_impl_key(node, source)
@@ -1250,6 +1343,7 @@ def extract_rust(path: Path) -> dict:
                         parent_impl_nid=impl_nid,
                         parent_impl_type=impl_type_bare,
                         parent_impl_key=impl_key,
+                        parent_is_trait=trait_node is not None,
                     )
             return
 
@@ -1325,6 +1419,9 @@ def extract_rust(path: Path) -> dict:
     # `drop` and `x.len()` to a free `fn len`.
     label_to_nid: dict[str, str] = {}
     method_label_to_nid: dict[str, str] = {}
+    # label -> {inline mod path: node id}, for items, so a bare `f()` reaches the
+    # `f` of the caller's own `mod` block before an outer one.
+    label_mod_nids: dict[str, dict[tuple[str, ...], str]] = {}
     for n in nodes:
         raw = n["label"]
         normalised = raw.strip("()").lstrip(".")
@@ -1333,6 +1430,27 @@ def extract_rust(path: Path) -> dict:
                 method_label_to_nid[normalised] = n["id"]
         else:
             label_to_nid[normalised] = n["id"]
+            label_mod_nids.setdefault(normalised, {})[nid_mods.get(n["id"], ())] = n["id"]
+
+    def lookup_item(name: str, mods: tuple[str, ...], exact: bool = False) -> str | None:
+        """The item ``name`` seen from inline mod ``mods``: its own mod first,
+        then each enclosing one (as `use super::*` brings in), then the one
+        item of that name in the file. ``exact`` looks in ``mods`` only."""
+        by_mod = label_mod_nids.get(name, {})
+        if exact:
+            return by_mod.get(mods)
+        for depth in range(len(mods), -1, -1):
+            if mods[:depth] in by_mod:
+                return by_mod[mods[:depth]]
+        return next(iter(by_mod.values())) if len(by_mod) == 1 else None
+
+    def lookup_method(owner: str, name: str, mods: tuple[str, ...]) -> str | None:
+        """The one method ``name`` of type ``owner`` seen from inline mod ``mods``."""
+        for depth in range(len(mods), -1, -1):
+            owned = impl_methods.get((mods[:depth], owner, name))
+            if owned:
+                return next(iter(owned)) if len(owned) == 1 else None
+        return None
 
     # Nodes whose label has no `()` suffix are data definitions (structs, enums,
     # traits, statics), not callables. In Rust `Foo(x)` / `Foo { .. }` onto one
@@ -1349,6 +1467,8 @@ def extract_rust(path: Path) -> dict:
         if (name_node := mod_node.child_by_field_name("name")) is not None
     )
 
+    mod_paths_in_file: set[tuple[str, ...]] = set(nid_mods.values())
+
     seen_call_pairs: set[tuple[str, str]] = set()
     raw_calls: list[dict] = []
 
@@ -1358,6 +1478,7 @@ def extract_rust(path: Path) -> dict:
         self_type: str | None = None,
         self_impl_key: str | None = None,
         typer: "_RustReceiverTyper | None" = None,
+        mods: tuple[str, ...] = (),
     ) -> None:
         if node.type == "function_item":
             return
@@ -1452,17 +1573,26 @@ def extract_rust(path: Path) -> dict:
                     # file. Matching the bare name instead sent `Arc::new(x)` and
                     # `B::new()` to whichever `fn new` the file happened to define.
                     owner = _rust_type_last_segment(qualifier_type or self_type or "")
-                    owned = impl_methods.get((owner, callee_name), set())
-                    tgt_nid = next(iter(owned)) if len(owned) == 1 else None
+                    tgt_nid = lookup_method(owner, callee_name, mods)
                     if tgt_nid is None and qualifier_type is not None:
                         # `Enum::Variant(x)` constructs a value: the variant node.
-                        named = label_to_nid.get(callee_name)
+                        named = lookup_item(callee_name, mods)
                         tgt_nid = named if named in type_nids else None
-                elif is_scoped_call and not _rust_in_file_module_path(scoped_path, node, inline_mod_names):
+                elif is_scoped_call:
                     # `util::f()` / `crate::f()` names a module, which is another
                     # file unless the path is `self::` or an inline `mod` here:
                     # the bare name `f` in this file is the wrong function.
                     tgt_nid = None
+                    if scoped_path and _rust_in_file_module_path(scoped_path, node, inline_mod_names):
+                        if scoped_path == ["self"]:
+                            target_mods = mods
+                        elif scoped_path == ["super"]:
+                            target_mods = mods[:-1]
+                        elif mods + tuple(scoped_path) in mod_paths_in_file:
+                            target_mods = mods + tuple(scoped_path)
+                        else:
+                            target_mods = tuple(scoped_path)
+                        tgt_nid = lookup_item(callee_name, target_mods, exact=True)
                 elif is_member_call and not is_self_call:
                     # `x.m()` binds by the receiver's type in the corpus pass, or
                     # not at all: by bare name it reached whichever `m` the file
@@ -1474,7 +1604,7 @@ def extract_rust(path: Path) -> dict:
                     # trait's own methods are the ones in this file.
                     tgt_nid = method_label_to_nid.get(callee_name)
                 else:
-                    tgt_nid = label_to_nid.get(callee_name)
+                    tgt_nid = lookup_item(callee_name, mods)
                 if tgt_nid and tgt_nid != caller_nid:
                     pair = (caller_nid, tgt_nid)
                     if pair not in seen_call_pairs:
@@ -1533,11 +1663,11 @@ def extract_rust(path: Path) -> dict:
                             rc_entry["rust_self_impl_key"] = self_impl_key
                     raw_calls.append(rc_entry)
         for child in node.children:
-            walk_calls(child, caller_nid, self_type, self_impl_key, typer)
+            walk_calls(child, caller_nid, self_type, self_impl_key, typer, mods)
 
-    for caller_nid, body_node, impl_type, impl_key in function_bodies:
+    for caller_nid, body_node, impl_type, impl_key, caller_mods in function_bodies:
         typer = _RustReceiverTyper(getattr(body_node, "parent"), source, impl_type)  # the fn item
-        walk_calls(body_node, caller_nid, impl_type, impl_key, typer)
+        walk_calls(body_node, caller_nid, impl_type, impl_key, typer, caller_mods)
 
     for node in nodes:
         if not node["source_file"] and node["label"] in use_roots:

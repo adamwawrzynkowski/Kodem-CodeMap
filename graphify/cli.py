@@ -4385,6 +4385,7 @@ def dispatch_command(cmd: str) -> None:
                             "_ts_fields", "_ts_static_fields",
                             "_py_fixture", "_py_return_type",
                             "_rust_ret", "_rust_ret_ok", "_rust_fields",
+                            "_rust_mod_path", "_rust_vis", "_rust_cfg_test",
                         ):
                             if _node.get(_marker):
                                 _ctx_node[_marker] = _node[_marker]
