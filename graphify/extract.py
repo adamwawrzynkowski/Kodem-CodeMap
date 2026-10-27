@@ -7714,6 +7714,55 @@ class _RustCorpusIndex:
         return self.module_path(caller)[:len(scope)] == scope
 
 
+def _resolve_csharp_attribute_suffix(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Bind a C# `[Foo]` attribute reference to the `FooAttribute` class.
+
+    C# lets an attribute drop its `Attribute` suffix, and the extractor emits
+    the name as written, so `[Cached]` reached a sourceless `Cached` stub even
+    when the corpus declares `class CachedAttribute : Attribute`. An attribute
+    edge whose target is such a stub, with no C# type of that exact name and
+    exactly one C# type named with the suffix, is repointed to that type; the
+    stub is dropped when nothing else references it.
+    """
+    node_by_id = {n.get("id"): n for n in all_nodes}
+    type_nids_by_label: dict[str, list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") != "contains":
+            continue
+        node = node_by_id.get(e.get("target"))
+        if node is None or not str(node.get("source_file") or "").endswith(".cs"):
+            continue
+        label = str(node.get("label") or "")
+        if label and not label.endswith(")"):
+            nids = type_nids_by_label.setdefault(label, [])
+            if node["id"] not in nids:
+                nids.append(node["id"])
+    retargeted: set[str] = set()
+    for e in all_edges:
+        if e.get("relation") != "references" or e.get("context") != "attribute":
+            continue
+        if not str(e.get("source_file") or "").endswith(".cs"):
+            continue
+        stub = node_by_id.get(e.get("target"))
+        if stub is None or stub.get("source_file"):
+            continue
+        label = str(stub.get("label") or "")
+        if not label or label.endswith("Attribute") or label in type_nids_by_label:
+            continue
+        candidates = type_nids_by_label.get(label + "Attribute", [])
+        if len(candidates) != 1 or candidates[0] == e.get("source"):
+            continue
+        retargeted.add(str(e["target"]))
+        e["target"] = candidates[0]
+    if retargeted:
+        referenced = {e.get("source") for e in all_edges} | {e.get("target") for e in all_edges}
+        all_nodes[:] = [n for n in all_nodes if n.get("id") not in retargeted or n.get("id") in referenced]
+
+
 def _resolve_rust_typed_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -8330,6 +8379,12 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver(
         "csharp_qualified_calls", frozenset({".cs"}), _resolve_csharp_qualified_calls
+    )
+)
+# C# `[Foo]` names the `FooAttribute` class: repoint the attribute reference.
+register_language_resolver(
+    LanguageResolver(
+        "csharp_attribute_suffix", frozenset({".cs"}), _resolve_csharp_attribute_suffix
     )
 )
 # C# member-level interface dispatch (#3003): a call through an injected

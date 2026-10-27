@@ -479,6 +479,28 @@ def _csharp_attribute_names(method_node, source: bytes) -> list[tuple[str, bool,
                     names.append((text, qualified, prefix if qualified else ""))
     return names
 
+def _csharp_attribute_typeof_args(decl_node, source: bytes) -> list[tuple[str, bool, str]]:
+    """The types named by `typeof(X)` in the arguments of a C# declaration's
+    attributes: `[UpdateInGroup(typeof(SimulationSystemGroup))]` and
+    `[RequireComponent(typeof(Rigidbody))]` give SimulationSystemGroup and
+    Rigidbody, as (name, qualified, qualifier) like _csharp_attribute_names."""
+    found: list[tuple[str, bool, str]] = []
+    skip = _csharp_type_parameters_in_scope(decl_node, source)
+    for child in decl_node.children:
+        if child.type != "attribute_list":
+            continue
+        stack = [c for c in child.children if c.type == "attribute"]
+        while stack:
+            n = stack.pop()
+            if n.type == "typeof_expression":
+                info = _read_csharp_type_name(n.child_by_field_name("type"), source)
+                if info and info[0] and info[0] not in skip and info[0][:1].isupper():
+                    found.append(info)
+                continue
+            stack.extend(n.children)
+    return found
+
+
 _JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS = frozenset({
     "class_declaration",
     "interface_declaration",
@@ -6352,6 +6374,28 @@ def _extract_generic(
             file_metadata["ruby_external_method_owners"] = external_owners
         file_node["metadata"] = sanitize_metadata(file_metadata)
 
+    def emit_csharp_attributes(decl_node, owner_nid: str, line: int) -> None:
+        """`references` edges from ``owner_nid`` to the attributes on a C#
+        declaration (context "attribute") and to the `typeof(X)` types in
+        their arguments (context "attribute_arg"). `[Foo]` names `Foo` as
+        written; the corpus pass _resolve_csharp_attribute_suffix binds it to
+        `FooAttribute` when only that is declared."""
+        for kind, found in (
+            ("attribute", _csharp_attribute_names(decl_node, source)),
+            ("attribute_arg", _csharp_attribute_typeof_args(decl_node, source)),
+        ):
+            for ref_name, qualified, qualifier in found:
+                target_nid = ensure_named_node(ref_name, line)
+                if target_nid == owner_nid:
+                    continue
+                ref_metadata = {"ref_token": ref_name}
+                if qualified:
+                    ref_metadata["qualified"] = True
+                if qualifier:
+                    ref_metadata["ref_qualifier"] = qualifier
+                add_edge(owner_nid, target_nid, "references", line,
+                         context=kind, metadata=ref_metadata)
+
     def walk(node, parent_class_nid: str | None = None) -> None:
         nonlocal ruby_singleton_context_depth
         t = node.type
@@ -6544,6 +6588,8 @@ def _extract_generic(
                     metadata = dict(metadata or {})
                     metadata["python_opaque_bases"] = True
             add_node(class_nid, class_name, line, metadata=metadata)
+            if config.ts_module == "tree_sitter_c_sharp":
+                emit_csharp_attributes(node, class_nid, line)
             if config.ts_module == "tree_sitter_ruby" and metadata:
                 # Reopened declarations collapse onto the same file-local id;
                 # merge fail-closed markers that add_node intentionally skips.
@@ -7359,6 +7405,9 @@ def _extract_generic(
         if (config.ts_module == "tree_sitter_c_sharp"
                 and t == "field_declaration"
                 and parent_class_nid):
+            # A field has no node of its own: its attributes (`[SerializeField]`)
+            # are its type's references.
+            emit_csharp_attributes(node, parent_class_nid, node.start_point[0] + 1)
             type_node = node.child_by_field_name("type")
             if type_node is None:
                 for child in node.children:
@@ -7456,6 +7505,7 @@ def _extract_generic(
                         add_node(property_nid, property_name, property_line)
                         add_edge(parent_class_nid, property_nid, "defines",
                                  property_line, context="field")
+                    emit_csharp_attributes(node, property_nid, property_line)
             type_node = node.child_by_field_name("type")
             if type_node is not None:
                 # Record the property's declared type for the method-scoped
@@ -8014,6 +8064,7 @@ def _extract_generic(
                     for p in params_node.children:
                         if p.type != "parameter":
                             continue
+                        emit_csharp_attributes(p, func_nid, line)
                         type_node = p.child_by_field_name("type")
                         refs: list[tuple[str, str, bool, str]] = []
                         _csharp_collect_type_refs(
@@ -8047,16 +8098,7 @@ def _extract_generic(
                                 metadata["ref_qualifier"] = qualifier
                             add_edge(func_nid, target_nid, "references", line,
                                      context=ctx, metadata=metadata)
-                for attr_name, qualified, qualifier in _csharp_attribute_names(node, source):
-                    target_nid = ensure_named_node(attr_name, line)
-                    if target_nid != func_nid:
-                        metadata = {"ref_token": attr_name}
-                        if qualified:
-                            metadata["qualified"] = True
-                        if qualifier:
-                            metadata["ref_qualifier"] = qualifier
-                        add_edge(func_nid, target_nid, "references", line,
-                                 context="attribute", metadata=metadata)
+                emit_csharp_attributes(node, func_nid, line)
 
             if config.ts_module == "tree_sitter_java":
                 params_node = node.child_by_field_name("parameters")
