@@ -77,7 +77,7 @@ from graphify.extractors.powershell import extract_powershell, extract_powershel
 from graphify.extractors.r import extract_r, resolve_r_sourced_calls  # noqa: F401
 from graphify.extractors.razor import extract_razor  # noqa: F401
 from graphify.extractors.robot import extract_robot  # noqa: F401
-from graphify.extractors.rust import extract_rust  # noqa: F401
+from graphify.extractors.rust import _RUST_PRELUDE_FUNCS, extract_rust  # noqa: F401
 from graphify.extractors.sln import extract_sln  # noqa: F401
 from graphify.extractors.solidity import (  # noqa: F401
     extract_solidity,
@@ -11258,7 +11258,10 @@ def extract(
         callee = rc.get("callee", "")
         if not callee:
             continue
-        if callee in _LANGUAGE_BUILTIN_GLOBALS:
+        is_rust_call = str(rc.get("source_file", "")).endswith(".rs")
+        # The shared builtin list is Python/JS/Swift names; Rust has no such
+        # free functions but `drop` (#2313).
+        if callee in (_RUST_PRELUDE_FUNCS if is_rust_call else _LANGUAGE_BUILTIN_GLOBALS):
             continue
         # Skip member-call callees: obj.log() → "log" has no import evidence
         # and collides with any top-level function named "log" in the corpus.
@@ -11310,6 +11313,12 @@ def extract(
             candidates = global_label_to_nids_ci.get(callee.lower(), [])
         if not candidates:
             continue
+        if is_rust_call:
+            # A bare Rust `f()` reaches a free fn or a tuple struct/variant,
+            # never a method (`.f()` nodes).
+            candidates = [c for c in candidates if not nid_to_label.get(c, "").startswith(".")]
+            if not candidates:
+                continue
         if rc.get("lang") == "csharp" and not rc.get("csharp_new") and len(candidates) > 1:
             if not _csharp_overload_cache:
                 _csharp_overload_cache.update(_csharp_overload_index(
@@ -11468,6 +11477,10 @@ def extract(
             if len(symbol_matches) == 1:
                 tgt = symbol_matches[0]
                 has_import_evidence = True
+            elif is_rust_call:
+                # Rust: a bare name defined more than once binds only through a
+                # `use` of exactly one of them; path proximity guessed (#2313).
+                continue
             else:
                 module_matches = [
                     c for c in candidates

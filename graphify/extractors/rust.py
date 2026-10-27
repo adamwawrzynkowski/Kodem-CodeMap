@@ -7,7 +7,6 @@ import hashlib
 import re
 from pathlib import Path
 from graphify.extractors.base import (
-    _LANGUAGE_BUILTIN_GLOBALS,
     _file_stem,
     _make_id,
     _read_source_bytes,
@@ -193,6 +192,11 @@ _RUST_TRAIT_METHOD_BLOCKLIST: frozenset[str] = frozenset({
     "remove", "contains", "collect", "map", "filter", "unwrap", "expect",
     "ok", "err", "some", "none", "send", "recv", "lock", "read", "write",
 })
+
+# Free functions of the Rust prelude, callable bare in any module. Language-local
+# rather than in the shared _LANGUAGE_BUILTIN_GLOBALS (#2313): only these, not
+# Python's `len` or JS's `map`, are never a cross-file call to the corpus.
+_RUST_PRELUDE_FUNCS: frozenset[str] = frozenset({"drop"})
 
 _RUST_PRIMITIVE_TYPES: frozenset[str] = frozenset({
     "bool", "char", "str", "f32", "f64",
@@ -1434,9 +1438,12 @@ def extract_rust(path: Path) -> dict:
                             bound = _rust_use_paths(scope, source).get(scoped_path[0]) if scope is not None else None
                             if bound:
                                 scoped_path = bound + scoped_path[1:]
+            # The shared `_LANGUAGE_BUILTIN_GLOBALS` holds Python/JS/Swift names
+            # (`len`, `map`, `set`), not Rust ones: a Rust fn or method of that
+            # name is an ordinary call (#2313). Only Rust's own prelude types
+            # (`Some(x)`, `Ok(x)`) are dropped, unless the file shadows them.
             if (
                 callee_name
-                and callee_name not in _LANGUAGE_BUILTIN_GLOBALS
                 and (callee_name not in _RUST_BUILTIN_TYPES or callee_name in local_types)
             ):
                 if qualifier_type is not None or (is_self_call and self_type):
@@ -1506,7 +1513,13 @@ def extract_rust(path: Path) -> dict:
                             "source_file": str_path,
                             "source_location": f"L{node.start_point[0] + 1}",
                         })
-                elif callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST:
+                elif (
+                    not is_member_call
+                    or is_self_call
+                    or callee_name.lower() not in _RUST_TRAIT_METHOD_BLOCKLIST
+                ):
+                    # The blocklist guards only an untyped `x.m()`: a bare `len()`
+                    # names a free fn, and `self.run()` is typed by its impl.
                     rc_entry = {
                         "caller_nid": caller_nid,
                         "callee": callee_name,
