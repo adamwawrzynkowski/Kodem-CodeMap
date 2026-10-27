@@ -1,18 +1,23 @@
+# Modified by Kodem.
 """Tests for the language resolver registry (graphify.resolver_registry).
 
 The registry formalizes the previously hand-wired, suffix-gated cross-file
 resolution passes. These tests pin its contract so future languages can be
 registered with confidence: gating by suffix, in-order execution, in-place
-mutation, and fault isolation (a failing pass logs and is skipped, never
-aborting the build or blocking later passes).
+mutation, and failure handling (a failing pass stops the run, #3667; with
+GRAPHIFY_LENIENT_RESOLVERS=1 it logs and is skipped, never blocking later
+passes).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from graphify.resolver_registry import (
     LanguageResolver,
+    ResolverError,
     registered_resolvers,
     run_language_resolvers,
 )
@@ -49,7 +54,8 @@ def test_resolvers_run_in_given_order() -> None:
     assert log == ["first", "second"]
 
 
-def test_failing_resolver_is_isolated() -> None:
+def test_failing_resolver_is_isolated_when_lenient(monkeypatch) -> None:
+    monkeypatch.setenv("GRAPHIFY_LENIENT_RESOLVERS", "1")
     log: list[str] = []
 
     def _boom(per_file, all_nodes, all_edges):
@@ -62,6 +68,23 @@ def test_failing_resolver_is_isolated() -> None:
     # Must not raise, and the later resolver still runs.
     run_language_resolvers([Path("a.rb")], [], [], [], resolvers=resolvers)
     assert log == ["after"]
+
+
+def test_failing_resolver_fails_the_run_by_default(monkeypatch) -> None:
+    """#3667: a skipped pass silently drops its edges, so it raises."""
+    monkeypatch.delenv("GRAPHIFY_LENIENT_RESOLVERS", raising=False)
+    log: list[str] = []
+
+    def _boom(per_file, all_nodes, all_edges):
+        raise RuntimeError("resolver blew up")
+
+    resolvers = [
+        LanguageResolver("boom", frozenset({".rb"}), _boom),
+        _make_resolver("after", ".rb", log),
+    ]
+    with pytest.raises(ResolverError, match="boom resolution failed: resolver blew up"):
+        run_language_resolvers([Path("a.rb")], [], [], [], resolvers=resolvers)
+    assert log == []
 
 
 def test_resolver_mutates_edges_in_place() -> None:

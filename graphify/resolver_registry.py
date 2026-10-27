@@ -1,3 +1,4 @@
+# Modified by Kodem.
 """Registry for cross-file, language-specific resolution passes.
 
 Some call/reference edges can only be resolved with language-specific knowledge
@@ -17,12 +18,22 @@ its own, separate from the multi-thousand-line ``extract`` module.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 _LOG = logging.getLogger(__name__)
+
+# Set to "1" to log a failing resolver and continue, upstream's behavior. By
+# default a failure stops the run: a skipped pass silently drops every edge it
+# would have made (#3667).
+LENIENT_RESOLVERS_ENV = "GRAPHIFY_LENIENT_RESOLVERS"
+
+
+class ResolverError(RuntimeError):
+    """A language resolver raised; the run stops instead of dropping its edges."""
 
 
 @dataclass(frozen=True)
@@ -66,10 +77,11 @@ def run_language_resolvers(
 ) -> None:
     """Run every resolver whose suffix appears in ``paths``.
 
-    Behaviorally identical to the prior hand-wired sequence of suffix-gated,
-    try/except-wrapped passes: same activation rule (suffix present), same
-    failure handling (log a warning and continue to the next pass), same
-    execution order (registration order).
+    Same activation rule (suffix present) and execution order (registration
+    order) as the prior hand-wired sequence of suffix-gated passes. A failing
+    pass raises ``ResolverError`` (#3667: a logged warning hid every edge the
+    pass would have made); with ``GRAPHIFY_LENIENT_RESOLVERS=1`` it is logged
+    as a warning and the next pass runs, as upstream does.
 
     ``resolvers`` defaults to the global registry; tests pass an explicit list to
     exercise the driver in isolation.
@@ -85,4 +97,6 @@ def run_language_resolvers(
         try:
             resolver.resolve(per_file, all_nodes, all_edges)
         except Exception as exc:
+            if os.environ.get(LENIENT_RESOLVERS_ENV) != "1":
+                raise ResolverError(f"{resolver.name} resolution failed: {exc}") from exc
             _LOG.warning("%s resolution failed, skipping: %s", resolver.name, exc)
