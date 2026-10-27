@@ -26,8 +26,10 @@ from graphify.paths import default_graph_json as _default_graph_json
 KODEM_SERVER_NAME = "kodem-codemap"
 KODEM_TOOL_NAMES = ("query_graph", "get_node", "get_neighbors", "shortest_path")
 KODEM_INSTRUCTIONS = (
-    "Code Map: a graph of this project's code. Use query_graph or shortest_path for "
-    "questions about how code connects; use grep and read for a known file or symbol. "
+    "Code Map: a graph of this project's code. Ask it before you search files: query_graph "
+    "for a question about the code, get_node and get_neighbors for a symbol, shortest_path "
+    "for how two parts connect. Rely on its answers and read only the lines that it names; "
+    "search files only for what it cannot answer, such as strings or configuration. "
     "In answers, a NODE line without a path is in the file of the NODE line above it."
 )
 _KODEM_DEFAULT_DEPTH = 2
