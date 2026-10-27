@@ -1,0 +1,86 @@
+# Modified by Kodem.
+# Builds the Code Map runtime archive for every target that Kodem supports (FORK.md, "Runtime
+# archive") and stages one draft release v<version> with the archives and their .sha256 files.
+# Nothing is staged unless every build succeeds. Each target builds on a runner of that target,
+# because the dependencies include native wheels.
+#
+# Start it with Run workflow. A ruleset reserves release tags for the owner's accounts, so publish
+# the draft on the Releases page; that creates the tag. Kodem downloads
+# releases/download/v<version>/kodem-codemap-<version>-<target>.tar.gz.
+name: Runtime release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.12"
+      - name: Build the runtime
+        shell: bash
+        run: uv run --frozen --no-project python scripts/kodem/build_runtime.py --target ${{ matrix.target }} --out dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  stage:
+    name: Stage draft release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: runtime-*
+          path: dist
+          merge-multiple: true
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' graphify/kodem_main.py)
+          [ -n "$version" ]
+          tag="v$version"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            [ "$draft" = true ] || { echo "release $tag is already published" >&2; exit 1; }
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+              --title "Code Map runtime $version" \
+              --notes "Kodem Code Map runtime $version, based on graphify 0.9.96. See FORK.md."
+          fi
+          gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
