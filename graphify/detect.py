@@ -1,3 +1,4 @@
+# Modified by Kodem.
 # file discovery, type classification, and corpus health checks
 from __future__ import annotations
 import fnmatch
@@ -1220,6 +1221,19 @@ def _has_msbuild_markers(d: "Path", markers: tuple, max_depth: int) -> bool:
     return False
 
 
+# Unity's generated folders, pruned only beside a Unity project's own layout.
+_UNITY_GENERATED_DIRS = frozenset({"Library", "Temp", "Logs", "obj"})
+
+
+def _is_unity_project_root(folder: Path) -> bool:
+    """Whether ``folder`` is a Unity project root: it holds both `Assets/` and
+    `ProjectSettings/`."""
+    try:
+        return (folder / "Assets").is_dir() and (folder / "ProjectSettings").is_dir()
+    except OSError:
+        return False
+
+
 def _is_noise_dir(part: str, parent: "Path | None" = None) -> bool:
     """Return True if this directory name looks like a venv, cache, or dep dir."""
     if part in _SKIP_DIRS:
@@ -1244,6 +1258,12 @@ def _is_noise_dir(part: str, parent: "Path | None" = None) -> bool:
         if parent is None:
             return False  # cannot verify; keep a possibly-real code dir
         return _has_build_output_markers(parent / part)
+    if part in _UNITY_GENERATED_DIRS and parent is not None and _is_unity_project_root(parent):
+        # Unity's generated folders beside Assets/ and ProjectSettings/: the
+        # Library/ import cache (PackageCache holds every package's sources),
+        # Temp/, Logs/ and the IDE's obj/. A Unity project may have no
+        # .gitignore yet, so these are pruned on Unity's own layout.
+        return True
     if part in ("obj", "bin"):
         # Ambiguous: MSBuild intermediate/output dirs OR real source (Rust's
         # src/bin/, script dirs). Depths reach a legacy obj/<config>/ and a
