@@ -1,4 +1,5 @@
 # MCP stdio server - exposes graph query tools to Claude and other agents
+# Modified by Kodem.
 from __future__ import annotations
 import json
 import math
@@ -16,6 +17,96 @@ from networkx.readwrite import json_graph
 from graphify.security import sanitize_label, check_graph_file_size_cap, _CONTROL_CHAR_RE
 from graphify.build import edge_datas, has_parallel_links
 from graphify.paths import default_graph_json as _default_graph_json
+
+# Kodem's runtime (graphify.kodem_main serve) sets GRAPHIFY_KODEM_MCP=1. The
+# server then lists four tools with short schemas, answers in a compact form and
+# uses smaller default budgets, because every tool definition and answer costs
+# the agent context tokens on each turn.
+KODEM_SERVER_NAME = "kodem-codemap"
+KODEM_TOOL_NAMES = ("query_graph", "get_node", "get_neighbors", "shortest_path")
+KODEM_INSTRUCTIONS = (
+    "Code Map: a graph of this project's code. Use query_graph or shortest_path for "
+    "questions about how code connects; use grep and read for a known file or symbol. "
+    "In answers, a NODE line without a path is in the file of the NODE line above it."
+)
+_KODEM_DEFAULT_DEPTH = 2
+_KODEM_DEFAULT_BUDGET = 1200
+
+
+def kodem_mode() -> bool:
+    """Returns whether the server runs as Kodem's Code Map server."""
+    return os.environ.get("GRAPHIFY_KODEM_MCP", "").lower() in ("1", "true", "yes")
+
+
+def default_depth() -> int:
+    """Returns the default traversal depth of query_graph."""
+    return _KODEM_DEFAULT_DEPTH if kodem_mode() else 3
+
+
+def default_budget() -> int:
+    """Returns the default token budget of the tools that take one."""
+    return _KODEM_DEFAULT_BUDGET if kodem_mode() else 2000
+
+
+def group_by_file(G: nx.Graph, nodes: list[str], seeds: list[str]) -> list[str]:
+    """Returns ``nodes`` grouped by source file, files in first-seen order (seed files first).
+
+    Within a file the nodes keep their order, so the most relevant node of each
+    file still comes first. Upstream #4469 measured the same files in the same
+    order at about 1.7x fewer tokens.
+    """
+    files: dict[str, list[str]] = {}
+    for nid in seeds:
+        files.setdefault(str(G.nodes[nid].get("source_file") or ""), [])
+    for nid in nodes:
+        files.setdefault(str(G.nodes[nid].get("source_file") or ""), []).append(nid)
+    return [nid for members in files.values() for nid in members]
+
+
+def kodem_tools(types) -> list:
+    """Returns the four tool definitions of Kodem's Code Map server."""
+    label = {"type": "string", "description": "Symbol name or node ID"}
+    return [
+        types.Tool(
+            name="query_graph",
+            description="Find the code related to a question and how it connects.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "depth": {"type": "integer", "description": "Hops, 1-6 (default 2)"},
+                    "token_budget": {"type": "integer", "description": "Default 1200"},
+                },
+                "required": ["question"],
+            },
+        ),
+        types.Tool(
+            name="get_node",
+            description="Show one symbol: file, line and attributes.",
+            inputSchema={"type": "object", "properties": {"label": label}, "required": ["label"]},
+        ),
+        types.Tool(
+            name="get_neighbors",
+            description="List what a symbol calls, uses or is used by.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "label": label,
+                    "relation_filter": {"type": "string", "description": "For example calls"},
+                },
+                "required": ["label"],
+            },
+        ),
+        types.Tool(
+            name="shortest_path",
+            description="Show how two symbols connect.",
+            inputSchema={
+                "type": "object",
+                "properties": {"source": label, "target": label, "undirected": {"type": "boolean"}},
+                "required": ["source", "target"],
+            },
+        ),
+    ]
 
 try:
     with warnings.catch_warnings():
@@ -1157,6 +1248,10 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
         nodes - seed_set,
         key=lambda n: (dist.get(n, 1 << 30), -G.degree(n), str(n)),
     )
+    compact = kodem_mode()
+    previous_file = None
+    if compact:
+        ordered = seed_hits + group_by_file(G, ordered[len(seed_hits):], seed_hits)
     for nid in ordered:
         d = G.nodes[nid]
         # Every LLM-derived field passes through sanitize_label before being
@@ -1197,14 +1292,23 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
             if len(attrs_summary) > 200:
                 attrs_summary = attrs_summary[:197] + "..."
             attrs_suffix = f" attrs={{{sanitize_label(attrs_summary)}}}"
-        line = (
-            f"NODE {sanitize_label(d.get('label', nid))} "
-            f"[src={sanitize_label(str(d.get('source_file', '')))} "
-            f"loc={sanitize_label(str(d.get('source_location', '')))} "
-            f"community={sanitize_label(str(d.get('community_name') or d.get('community', '')))}"
-            f"{learning_suffix}"
-            f"{attrs_suffix}]"
-        )
+        if compact:
+            # Upstream #4469: the file path is written once for a run of nodes in
+            # the same file, and empty fields are left out.
+            source_file = sanitize_label(str(d.get('source_file', '')))
+            location = sanitize_label(str(d.get('source_location', '')))
+            place = location if source_file == previous_file else f"{source_file}:{location}"
+            previous_file = source_file
+            line = f"NODE {sanitize_label(d.get('label', nid))} {place.strip(':')}{learning_suffix}{attrs_suffix}".rstrip()
+        else:
+            line = (
+                f"NODE {sanitize_label(d.get('label', nid))} "
+                f"[src={sanitize_label(str(d.get('source_file', '')))} "
+                f"loc={sanitize_label(str(d.get('source_location', '')))} "
+                f"community={sanitize_label(str(d.get('community_name') or d.get('community', '')))}"
+                f"{learning_suffix}"
+                f"{attrs_suffix}]"
+            )
         lines.append(line)
     for u, v in edges:
         if u in nodes and v in nodes:
@@ -1237,12 +1341,24 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
                     f" at={sanitize_label(str(d.get('source_file') or ''))}:{sanitize_label(_loc)}"
                     if _loc else ""
                 )
-                line = (
-                    f"EDGE {sanitize_label(G.nodes[src].get('label', src))} "
-                    f"--{sanitize_label(str(d.get('relation', '')))} "
-                    f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
-                    f"{sanitize_label(G.nodes[tgt].get('label', tgt))}{at_suffix}"
-                )
+                if compact:
+                    confidence = str(d.get('confidence', ''))
+                    tag = f" [{sanitize_label(confidence)}]" if confidence and confidence != "EXTRACTED" else ""
+                    edge_file = str(d.get('source_file') or '')
+                    site = _loc if edge_file == str(G.nodes[src].get('source_file') or '') else f"{edge_file}:{_loc}"
+                    line = (
+                        f"EDGE {sanitize_label(G.nodes[src].get('label', src))} "
+                        f"--{sanitize_label(str(d.get('relation', '')))}--> "
+                        f"{sanitize_label(G.nodes[tgt].get('label', tgt))}"
+                        f"{(' ' + sanitize_label(site)) if _loc else ''}{tag}"
+                    )
+                else:
+                    line = (
+                        f"EDGE {sanitize_label(G.nodes[src].get('label', src))} "
+                        f"--{sanitize_label(str(d.get('relation', '')))} "
+                        f"[{sanitize_label(str(d.get('confidence', '')))}{context_suffix}]--> "
+                        f"{sanitize_label(G.nodes[tgt].get('label', tgt))}{at_suffix}"
+                    )
                 lines.append(line)
     output = "\n".join(lines)
     if len(output) > char_budget:
@@ -1272,6 +1388,16 @@ def _subgraph_to_text(G: nx.Graph, nodes: set[str], edges: list[tuple], token_bu
         # already known to be over budget, yet said nothing about it. Report the
         # real size instead of silence — still the complete, non-truncated
         # answer, just an honest one.
+        if cut_count == 0 and compact:
+            # Kodem keeps every answer inside its budget: once all nodes fit,
+            # the trailing edges are cut, and the notice says how many.
+            total_edges = sum(1 for l in lines if l.startswith("EDGE "))
+            shown_edges = output[:cut_at].count("\nEDGE ")
+            return (
+                f"[i] All {total_nodes} nodes shown; {shown_edges} of {total_edges} edges fit the "
+                f"~{token_budget}-token budget. Use get_neighbors on a node for its edges.\n\n"
+                + output[:cut_at]
+            )
         if cut_count == 0:
             # Reached only inside `len(output) > char_budget`, so every node
             # fits but the full nodes+edges output does not: an honest
@@ -2298,6 +2424,8 @@ def _build_server(graph_path: str):
     # mcp 1.x exposes the @server.list_tools()/... decorator API, mcp 2.x
     # replaced it with on_list_tools=/... constructor callbacks.
     async def list_tools() -> list[types.Tool]:
+        if kodem_mode():
+            return kodem_tools(types)
         _tools = [
             types.Tool(
                 name="query_graph",
@@ -2459,8 +2587,8 @@ def _build_server(graph_path: str):
         from graphify import querylog
         question = arguments["question"]
         mode = arguments.get("mode", "bfs")
-        depth = min(int(arguments.get("depth", 3)), 6)
-        budget = int(arguments.get("token_budget", 2000))
+        depth = min(int(arguments.get("depth", default_depth())), 6)
+        budget = int(arguments.get("token_budget", default_budget()))
         context_filter = arguments.get("context_filter")
         _t0 = _time.perf_counter()
         result = _query_graph_text(
@@ -2528,7 +2656,7 @@ def _build_server(graph_path: str):
             return err
         lines = [f"Neighbors of {sanitize_label(G.nodes[nid].get('label', nid))}:"]
         lines.extend(_neighbor_lines(G, nid, rel_filter))
-        budget = int(arguments.get("token_budget", 2000))
+        budget = int(arguments.get("token_budget", default_budget()))
         return _cut_lines_to_budget(
             lines, budget, "Narrow with relation_filter or use get_node for a specific symbol"
         )
@@ -2775,6 +2903,10 @@ def _build_server(graph_path: str):
         arguments = dict(arguments or {})
         project_path = arguments.pop("project_path", None)
         handler = _handlers.get(name)
+        if kodem_mode() and name not in KODEM_TOOL_NAMES:
+            # Kodem's server serves one graph and offers only its four tools.
+            handler = None
+            project_path = None
         if not handler:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
         try:
@@ -2791,7 +2923,10 @@ def _build_server(graph_path: str):
     if hasattr(Server, "list_tools"):
         # mcp 1.x: decorator-based registration. The SDK wraps the raw returns
         # (list[Tool] -> ListToolsResult, str -> resource contents) itself.
-        server = Server("graphify")
+        if kodem_mode():
+            server = Server(KODEM_SERVER_NAME, instructions=KODEM_INSTRUCTIONS)
+        else:
+            server = Server("graphify")
         server.list_tools()(list_tools)
         server.call_tool()(call_tool)
         server.list_resources()(list_resources)
@@ -2829,8 +2964,9 @@ def _build_server(graph_path: str):
         except Exception:
             _version = "0"
         server = Server(
-            "graphify",
+            KODEM_SERVER_NAME if kodem_mode() else "graphify",
             version=_version,
+            instructions=KODEM_INSTRUCTIONS if kodem_mode() else None,
             on_list_tools=_on_list_tools,
             on_call_tool=_on_call_tool,
             on_list_resources=_on_list_resources,

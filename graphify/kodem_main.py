@@ -62,6 +62,7 @@ _BACKEND_VARIABLES = (
 # Settings that keep upstream features that Kodem does not use switched off.
 _FIXED_SETTINGS = {
     "GRAPHIFY_BACKEND": "none",
+    "GRAPHIFY_KODEM_MCP": "1",
     "GRAPHIFY_NO_AUTO_REFRESH": "1",
     "GRAPHIFY_NO_CTA": "1",
     "GRAPHIFY_NO_TIPS": "1",
