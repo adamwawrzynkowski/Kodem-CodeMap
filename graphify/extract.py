@@ -7714,6 +7714,143 @@ class _RustCorpusIndex:
         return self.module_path(caller)[:len(scope)] == scope
 
 
+# Unity calls these on a MonoBehaviour (or a type derived from one) by name; no
+# call site in the project names them.
+_UNITY_MESSAGE_BASES = frozenset({"MonoBehaviour", "NetworkBehaviour", "StateMachineBehaviour"})
+_UNITY_MESSAGES = frozenset({
+    "Awake", "Start", "Update", "FixedUpdate", "LateUpdate", "OnEnable", "OnDisable", "OnDestroy",
+})
+# DOTS: the entry points of a system and of a job, by the type it implements.
+_DOTS_ENTRY_POINTS: dict[str, frozenset[str]] = {
+    "ISystem": frozenset({"OnCreate", "OnUpdate", "OnDestroy"}),
+    "ISystemStartStop": frozenset({"OnStartRunning", "OnStopRunning"}),
+    "SystemBase": frozenset({"OnCreate", "OnUpdate", "OnDestroy", "OnStartRunning", "OnStopRunning"}),
+    "IJob": frozenset({"Execute"}),
+    "IJobEntity": frozenset({"Execute"}),
+    "IJobFor": frozenset({"Execute"}),
+    "IJobParallelFor": frozenset({"Execute"}),
+    "IJobChunk": frozenset({"Execute"}),
+    "IJobParallelForTransform": frozenset({"Execute"}),
+}
+# The calls that run a job: each binds to the job type's `Execute`.
+_DOTS_SCHEDULE_METHODS = frozenset({
+    "Schedule", "ScheduleParallel", "ScheduleByRef", "ScheduleParallelByRef", "Run", "RunByRef",
+})
+
+
+def _resolve_csharp_unity_entry_points(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Tag Unity and DOTS engine entry points; link job scheduling to `Execute`.
+
+    Unity and DOTS invoke these methods themselves, so nothing in the project
+    calls them and they read as dead code:
+
+    * `Awake`, `Start`, `Update`, `FixedUpdate`, `LateUpdate`, `OnEnable`,
+      `OnDisable`, `OnDestroy` of a type derived (through any chain of corpus
+      types) from `MonoBehaviour`;
+    * `OnCreate` / `OnUpdate` / `OnDestroy` of an `ISystem` or `SystemBase`;
+    * `Execute` of an `IJob`, `IJobEntity`, `IJobFor`, `IJobParallelFor`,
+      `IJobChunk` job.
+
+    Each gets the node attribute `entry_point: true`. A
+    `new XJob { .. }.Schedule()` / `ScheduleParallel()` / `Run()`, or the same
+    call on a local or field whose type the extractor recorded, gets a
+    `schedules` edge from the calling method to `XJob.Execute`, when `XJob` is
+    the one corpus job type of that name.
+    """
+    node_by_id = {n.get("id"): n for n in all_nodes}
+
+    def _cs(nid) -> bool:
+        return str(node_by_id.get(nid, {}).get("source_file") or "").endswith(".cs")
+
+    types_by_label: dict[str, list[str]] = {}
+    for e in all_edges:
+        if e.get("relation") == "contains" and _cs(e.get("target")):
+            label = str(node_by_id[e["target"]].get("label") or "")
+            if label and not label.endswith(")"):
+                nids = types_by_label.setdefault(label, [])
+                if e["target"] not in nids:
+                    nids.append(e["target"])
+    bases: dict[str, set[str]] = {}
+    methods: dict[str, dict[str, list[str]]] = {}
+    for e in all_edges:
+        relation, src, tgt = e.get("relation"), e.get("source"), e.get("target")
+        if relation in ("inherits", "implements") and _cs(src):
+            label = str(node_by_id.get(tgt, {}).get("label") or "").split("<", 1)[0]
+            if label:
+                bases.setdefault(src, set()).add(label.rsplit(".", 1)[-1])
+        elif relation == "method" and _cs(src):
+            name = str(node_by_id.get(tgt, {}).get("label") or "").strip(".").split("(", 1)[0]
+            if name:
+                methods.setdefault(src, {}).setdefault(name, []).append(tgt)
+
+    def _ancestors(nid: str) -> set[str]:
+        # Every base label reachable from ``nid`` through corpus types.
+        seen: set[str] = set()
+        pending = [nid]
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited or len(visited) > 64:
+                continue
+            visited.add(current)
+            for label in bases.get(current, ()):
+                seen.add(label)
+                pending.extend(types_by_label.get(label, ()))
+        return seen
+
+    job_types: set[str] = set()
+    for type_nid, own_methods in methods.items():
+        ancestors = _ancestors(type_nid)
+        wanted: set[str] = set()
+        if ancestors & _UNITY_MESSAGE_BASES:
+            wanted |= _UNITY_MESSAGES
+        for base, names in _DOTS_ENTRY_POINTS.items():
+            if base in ancestors:
+                wanted |= names
+                if base.startswith("IJob"):
+                    job_types.add(type_nid)
+        for name in wanted & own_methods.keys():
+            for method_nid in own_methods[name]:
+                node_by_id[method_nid]["entry_point"] = True
+
+    existing = {
+        (e.get("source"), e.get("target")) for e in all_edges if e.get("relation") == "schedules"
+    }
+    for result in per_file:
+        for rc in result.get("raw_calls", []) if isinstance(result, dict) else ():
+            if rc.get("lang") != "csharp" or rc.get("callee") not in _DOTS_SCHEDULE_METHODS:
+                continue
+            job_label = rc.get("receiver_type")
+            chain = rc.get("receiver_chain") or []
+            if not job_label and rc.get("receiver") is None and len(chain) == 1:
+                job_label = chain[0]  # `new XJob { .. }.Schedule()`
+            if not isinstance(job_label, str) or not job_label[:1].isupper():
+                continue
+            jobs = [t for t in types_by_label.get(job_label.split("<", 1)[0], []) if t in job_types]
+            if len(jobs) != 1:
+                continue
+            caller = rc.get("caller_nid")
+            for execute in methods.get(jobs[0], {}).get("Execute", []):
+                if (caller, execute) in existing or caller == execute:
+                    continue
+                existing.add((caller, execute))
+                all_edges.append({
+                    "source": caller,
+                    "target": execute,
+                    "relation": "schedules",
+                    "context": "call",
+                    "confidence": "EXTRACTED",
+                    "confidence_score": 1.0,
+                    "source_file": rc.get("source_file", ""),
+                    "source_location": rc.get("source_location"),
+                    "weight": 1.0,
+                })
+
+
 def _resolve_csharp_attribute_suffix(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -8379,6 +8516,12 @@ register_language_resolver(
 register_language_resolver(
     LanguageResolver(
         "csharp_qualified_calls", frozenset({".cs"}), _resolve_csharp_qualified_calls
+    )
+)
+# Unity / DOTS: tag engine-invoked methods and link job scheduling to `Execute`.
+register_language_resolver(
+    LanguageResolver(
+        "csharp_unity_entry_points", frozenset({".cs"}), _resolve_csharp_unity_entry_points
     )
 )
 # C# `[Foo]` names the `FooAttribute` class: repoint the attribute reference.
