@@ -1,4 +1,5 @@
 # monitor a folder and auto-trigger --update when files change
+# Modified by Kodem.
 from __future__ import annotations
 import contextlib
 import json
@@ -1657,6 +1658,11 @@ def _inputs_unchanged(detected: dict, manifest_path: Path, root: Path) -> bool:
 _BUILD_STATE_NAME = ".graphify_build_state.json"
 
 
+def _viewer_on_request() -> bool:
+    """Returns whether graph.html is written only on request (Kodem's runtime), so updates ignore it."""
+    return os.environ.get("GRAPHIFY_NO_VIZ", "").lower() in ("1", "true", "yes")
+
+
 def _extractor_epoch() -> str:
     """Identity of the extraction pipeline behind the current AST output.
 
@@ -1835,6 +1841,8 @@ def _build_state_matches(out: Path, state: dict) -> bool:
         return False
     if prev.get("graph_size") != st.st_size or prev.get("graph_mtime_ns") != st.st_mtime_ns:
         return False
+    if _viewer_on_request():
+        return True
     from graphify.exporters.html import _HTML_STALE_MARKER
     if (out / _HTML_STALE_MARKER).exists():
         return False
@@ -1852,6 +1860,10 @@ def _reconcile_graph_html(out: Path, graph_data: dict) -> str | None:
     Returns ``"rendered"`` or ``"removed"`` when it changed the HTML state,
     otherwise ``None``.
     """
+    # Kodem writes the viewer page on request (`kodem_main html`), so updates
+    # leave graph.html as it is.
+    if _viewer_on_request():
+        return None
     html_target = out / "graph.html"
     from graphify.exporters.html import _HTML_STALE_MARKER, _viz_node_limit
     stale_marker = out / _HTML_STALE_MARKER
@@ -2891,8 +2903,10 @@ def _rebuild_code(
                 return False
             from graphify.exporters.html import _HTML_STALE_MARKER
             # Mark before graph.json advances so an interruption cannot leave a
-            # previous visualization looking current to the fast path.
-            (out / _HTML_STALE_MARKER).touch()
+            # previous visualization looking current to the fast path. Kodem
+            # compares graph.html with graph.json itself.
+            if not _viewer_on_request():
+                (out / _HTML_STALE_MARKER).touch()
             from graphify.export import backup_if_protected as _backup
             _backup(out)
             # os_replace_with_fallback, not a plain Path.replace (#2689): this

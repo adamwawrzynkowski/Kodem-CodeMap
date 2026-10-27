@@ -1,3 +1,4 @@
+# Modified by Kodem.
 [build-system]
 requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
@@ -130,6 +131,8 @@ all = ["mcp>=1,<3", "starlette>=1.3.1,<2", "neo4j", "falkordb", "pypdf>=6.19.0",
 [project.scripts]
 graphify = "graphify.__main__:main"
 graphify-mcp = "graphify.serve:_main"
+# Kodem runs the Code Map runtime through this entry point only (FORK.md).
+kodem-codemap = "graphify.kodem_main:main"
 
 [dependency-groups]
 dev = [
@@ -168,7 +171,7 @@ include-package-data = false
 # under graphify/always_on/. There is no graphify/skills/<host>/SKILL.md in the
 # repo, so no SKILL.md glob is needed here.
 # graphify/pi/ is the native Pi guard package; Pi registers it in place from the installation.
-graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-kilo.md", "command-kilo.md", "skill-aider.md", "skill-amp.md", "skill-agents.md", "skill-copilot.md", "skill-claw.md", "skill-windows.md", "skill-droid.md", "skill-trae.md", "skill-kiro.md", "skill-vscode.md", "skill-pi.md", "skill-devin.md", "skills/*/references/*.md", "always_on/*.md", "pi/package.json", "pi/index.ts"]
+graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-kilo.md", "command-kilo.md", "skill-aider.md", "skill-amp.md", "skill-agents.md", "skill-copilot.md", "skill-claw.md", "skill-windows.md", "skill-droid.md", "skill-trae.md", "skill-kiro.md", "skill-vscode.md", "skill-pi.md", "skill-devin.md", "skills/*/references/*.md", "always_on/*.md", "pi/package.json", "pi/index.ts", "kodem_assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
