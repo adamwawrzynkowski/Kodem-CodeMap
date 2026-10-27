@@ -18,7 +18,9 @@ Kodem depends on this interface. Change it only together with Kodem.
 
 ### Runtime archive
 
-One archive per target: `kodem-codemap-<version>-<target>.tar.gz`, with `<target>` one of `aarch64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`. Each archive has a `.sha256` file next to it in the GitHub release `v<version>`.
+One archive per target: `kodem-codemap-<version>-<target>.tar.gz`, with `<target>` one of `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu`. Each archive has a `.sha256` file next to it in the GitHub release `v<version>`.
+
+Windows on Arm uses the `x86_64-pc-windows-msvc` archive, which Windows 11 runs under emulation. `mcp` imports `cryptography`, and `cryptography` publishes no Windows Arm64 wheel after 46.0.3. A native archive would have to build `cryptography` and OpenSSL from source, outside the hash-checked lock, and keep that OpenSSL patched. Add the target again when `cryptography` publishes Windows Arm64 wheels.
 
 The archive root holds:
 

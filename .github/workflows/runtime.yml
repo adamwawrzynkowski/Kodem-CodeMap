@@ -2,7 +2,8 @@
 # Builds the Code Map runtime archive for every target that Kodem supports (FORK.md, "Runtime
 # archive") and stages one draft release v<version> with the archives and their .sha256 files.
 # Nothing is staged unless every build succeeds. Each target builds on a runner of that target,
-# because the dependencies include native wheels.
+# because the dependencies include native wheels. Windows on Arm uses the x86_64 Windows archive
+# under emulation (FORK.md, "Runtime archive").
 #
 # Start it with Run workflow, or let Kodem's build scripts start it (scripts/codemap-runtime.sh in
 # kodem-ade), which also publish the draft. A ruleset reserves release tags for the owner's accounts, so publish
@@ -39,9 +40,6 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             arch: x64
-          - target: aarch64-pc-windows-msvc
-            os: windows-11-arm
-            arch: arm64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             arch: x64

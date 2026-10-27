@@ -28,12 +28,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# python-build-standalone release 20261009, CPython 3.12.15, "install_only" archives.
+# python-build-standalone release 20261009, CPython 3.12.15, "install_only" archives. Windows on
+# Arm runs the x86_64 Windows runtime under emulation: cryptography, which mcp imports, publishes
+# no Windows Arm64 wheel after 46.0.3 (FORK.md, "Runtime archive").
 PYTHON_RELEASE = "20261009"
 PYTHON_VERSION = "3.12.15"
 PYTHON_ARCHIVES = {
     "aarch64-apple-darwin": "83dcb04777c798bd95f3687acf9ae84b09860272ee6bdfb05be8bcf9447f75b8",
-    "aarch64-pc-windows-msvc": "4da354e7366d4437fceea714eab1bbdca1eb17bba4491a3d20b9c6af94b44f68",
     "x86_64-pc-windows-msvc": "194c8f0d9e0de6f1c4576e5dfa67819a48c764be87608b74b8ad43387a57b93b",
     "x86_64-unknown-linux-gnu": "5864001bf969db329fadc2b654c4878c6027d170c6bd77e28f88666260bcaf63",
 }
