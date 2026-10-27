@@ -1,3 +1,4 @@
+# Modified by Kodem.
 """html — moved verbatim from graphify/export.py."""
 from __future__ import annotations
 
@@ -644,6 +645,8 @@ def to_html(
             "community": cid,
             "community_name": sanitize_label((community_labels or {}).get(cid, f"Community {cid}")),
             "source_file": sanitize_label(str(data.get("source_file") or "")),
+            # Kodem's viewer links each node to its line.
+            "source_location": sanitize_label(str(data.get("source_location") or "")),
             "file_type": data.get("file_type", ""),
             "degree": deg,
         }
