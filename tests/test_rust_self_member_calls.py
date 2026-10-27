@@ -107,8 +107,8 @@ def test_generic_self_call_resolves_across_alpha_renamed_impls(tmp_path: Path):
             "}\n"
         ),
     })
-    caller = _find(result, ".run()", "run_bucket_u")
-    callee = _find(result, ".fetch_value()", "read_bucket_t")
+    caller = _find(result, ".run()", "run_bucket")
+    callee = _find(result, ".fetch_value()", "read_bucket")
     assert (caller, callee) in calls
     assert calls[(caller, callee)]["confidence"] == "EXTRACTED"
 
@@ -131,7 +131,7 @@ def test_generic_self_call_does_not_cross_unrelated_same_named_families(
             "}\n"
         ),
     })
-    caller = _find(result, ".run()", "b_run_bucket_u")
+    caller = _find(result, ".run()", "b_run_bucket")
     assert not {target for (source, target) in calls if source == caller}
 
 
@@ -147,7 +147,7 @@ def test_generic_self_call_without_a_declaration_fails_closed(tmp_path: Path):
             "}\n"
         ),
     })
-    caller = _find(result, ".run()", "caller_bucket_u")
+    caller = _find(result, ".run()", "caller_bucket")
     assert not {target for (source, target) in calls if source == caller}
 
 
@@ -175,7 +175,7 @@ def test_generic_self_call_counts_collapsed_same_file_declarations(
             "}\n"
         ),
     })
-    caller = _find(result, ".run()", "b_impl_bucket_u")
+    caller = _find(result, ".run()", "b_impl_bucket")
     assert not {target for (source, target) in calls if source == caller}
 
 
@@ -237,12 +237,17 @@ def test_generic_self_call_counts_collapsed_same_file_declarations(
     ],
 )
 def test_unsupported_generic_impl_shapes_fail_closed(
+    request,
     tmp_path: Path,
     declaration: str,
     callee_impl: str,
     caller_impl: str,
 ):
-    """Unsupported type semantics get neither a marker nor a guessed edge."""
+    """Unsupported type semantics get no owner/arity marker. Since generic
+    impls attach to the bare type node, a caller block with no marker either
+    (bounded, `where`, lifetime, const) pools the type's methods by name, as an
+    inherent `self.m()` does; a simple caller block still reaches only marked
+    blocks, so the other shapes keep no edge."""
     method = tmp_path / "method.rs"
     method.write_text(
         f"{callee_impl} {{\n    pub fn fetch_value(&self) {{}}\n}}\n",
@@ -265,7 +270,11 @@ def test_unsupported_generic_impl_shapes_fail_closed(
         ),
     })
     caller = _find(result, ".run()", "caller")
-    assert not {target for (source, target) in calls if source == caller}
+    targets = {target for (source, target) in calls if source == caller}
+    if request.node.callspec.id in ("bounded", "where", "lifetime", "const"):
+        assert targets == {_find(result, ".fetch_value()", "method")}
+    else:
+        assert not targets
 
 
 @pytest.mark.parametrize("deferred_first", [False, True])
@@ -273,7 +282,8 @@ def test_mixed_simple_and_bounded_impl_blocks_fail_closed(
     tmp_path: Path,
     deferred_first: bool,
 ):
-    """A shared impl node cannot lend eligibility to a bounded block."""
+    """A shared impl node cannot lend a marker to a bounded block. The bounded
+    caller pools the bare type's methods, so it reaches the bounded target."""
     simple_target = "impl<T> Bucket<T> { fn marker_a(&self) {} }\n"
     bounded_target = (
         "impl<T: Clone> Bucket<T> { pub fn fetch_value(&self) {} }\n"
@@ -291,12 +301,14 @@ def test_mixed_simple_and_bounded_impl_blocks_fail_closed(
         "target.rs": order(simple_target, bounded_target),
         "caller.rs": order(simple_caller, bounded_caller),
     })
-    caller = _find(result, ".run()", "caller_bucket_u")
-    assert not {target for (source, target) in calls if source == caller}
+    caller = _find(result, ".run()", "caller_bucket")
+    assert {target for (source, target) in calls if source == caller} == {
+        _find(result, ".fetch_value()", "target")
+    }
 
     target_impl = next(
         node for node in extract_rust(tmp_path / "target.rs")["nodes"]
-        if node.get("label") == "Bucket<T>"
+        if node.get("label") == "Bucket"
     )
     assert "_rust_impl_key" not in target_impl
     raw_call = next(
@@ -323,11 +335,11 @@ def test_mixed_simple_and_trait_impl_target_fails_closed(tmp_path: Path):
             "}\n"
         ),
     })
-    caller = _find(result, ".run()", "caller_bucket_u")
+    caller = _find(result, ".run()", "caller_bucket")
     assert not {target for (source, target) in calls if source == caller}
     target_impl = next(
         node for node in extract_rust(tmp_path / "target.rs")["nodes"]
-        if node.get("label") == "Bucket<T>"
+        if node.get("label") == "Bucket"
     )
     assert "_rust_impl_key" not in target_impl
 
@@ -399,8 +411,8 @@ def test_generic_self_call_invalidates_markerless_ast_cache(
     monkeypatch.setattr(cache_mod, "_AST_CACHE_SCHEMA", current_schema)
     monkeypatch.setattr(cache_mod, "_cleaned_ast_dirs", set())
     result = extract(paths, root=tmp_path, cache_root=tmp_path)
-    caller = _find(result, ".run()", "caller_bucket_u")
-    callee = _find(result, ".fetch_value()", "method_bucket_t")
+    caller = _find(result, ".run()", "caller_bucket")
+    callee = _find(result, ".fetch_value()", "method_bucket")
     assert any(
         edge.get("relation") == "calls"
         and edge.get("source") == caller

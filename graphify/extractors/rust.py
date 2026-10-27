@@ -868,7 +868,9 @@ def extract_rust(path: Path) -> dict:
                 refs: list[tuple[str, str]] = []
                 _rust_collect_type_refs(type_node, source, False, refs)
                 bare = next((ref for ref, role in refs if role == "type"), type_name)
-                items_by_id.setdefault(_make_id(stem, *mods, type_name), set()).add((True, bare))
+                items_by_id.setdefault(
+                    _make_id(stem, *mods, _rust_type_last_segment(type_name) or type_name), set()
+                ).add((True, bare))
                 impl_bare_names[node.start_byte] = bare
             return
         if t == "use_declaration":
@@ -1005,6 +1007,7 @@ def extract_rust(path: Path) -> dict:
         parent_impl_type: str | None = None,
         parent_impl_key: str | None = None,
         parent_is_trait: bool = False,
+        parent_trait: str | None = None,
     ) -> None:
         t = node.type
 
@@ -1031,7 +1034,7 @@ def extract_rust(path: Path) -> dict:
                 func_name = _read_text(name_node, source)
                 line = node.start_point[0] + 1
                 if parent_impl_nid:
-                    func_nid = _make_id(parent_impl_nid, func_name)
+                    func_nid = _make_id(parent_impl_nid, *([parent_trait] if parent_trait else []), func_name)
                     add_node(func_nid, f".{func_name}()", line)
                     add_edge(parent_impl_nid, func_nid, "method", line)
                     if parent_impl_type:
@@ -1272,7 +1275,7 @@ def extract_rust(path: Path) -> dict:
                     return
                 line = node.start_point[0] + 1
                 if parent_impl_nid:
-                    item_nid = _make_id(parent_impl_nid, item_name)
+                    item_nid = _make_id(parent_impl_nid, *([parent_trait] if parent_trait else []), item_name)
                     add_node(item_nid, f".{item_name}", line)
                     add_edge(parent_impl_nid, item_nid, "contains", line)
                 else:
@@ -1300,15 +1303,21 @@ def extract_rust(path: Path) -> dict:
             impl_key: str | None = None
             if type_node:
                 type_name = _read_text(type_node, source).strip()
+                # `impl<T> Foo<T>` and `impl Tr for &Foo` are blocks of `Foo`: one
+                # node with the struct, not one per spelling of the generics.
+                impl_label = _rust_type_last_segment(type_name) or type_name
                 impl_nid = file_item_nid(
-                    item_id(type_name), impl_bare_names.get(node.start_byte, type_name)
+                    item_id(impl_label), impl_bare_names.get(node.start_byte, type_name)
                 )
-                add_node(impl_nid, type_name, node.start_point[0] + 1)
+                add_node(impl_nid, impl_label, node.start_point[0] + 1)
                 impl_key = _rust_simple_generic_impl_key(node, source)
                 # Bare name (generics stripped) for typing a `self.` receiver
                 # inside this block's methods (#2234) — `impl Foo<T>` types
                 # `self` as `Foo`, not the literal `Foo<T>` text.
                 impl_type_bare = type_name.split("<")[0].strip()
+            # The trait an `impl Tr for X` implements, in its methods' ids: an
+            # `impl Display` and an `impl Debug` both define `fmt`.
+            impl_trait = _rust_type_last_segment(_read_text(trait_node, source)) if trait_node is not None else None
             if trait_node is not None and impl_nid is not None:
                 refs: list[tuple[str, str]] = []
                 _rust_collect_type_refs(trait_node, source, False, refs, local_type_names)
@@ -1344,6 +1353,7 @@ def extract_rust(path: Path) -> dict:
                         parent_impl_type=impl_type_bare,
                         parent_impl_key=impl_key,
                         parent_is_trait=trait_node is not None,
+                        parent_trait=impl_trait,
                     )
             return
 
