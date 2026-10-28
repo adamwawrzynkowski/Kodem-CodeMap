@@ -41,7 +41,7 @@ Kodem runs `<interpreter> -P -m graphify.kodem_main <command> ...`. `-P` keeps t
 | `build <repo> --out <dir>` | Maps `<repo>` from the beginning into `<dir>` | `{"nodes": n, "edges": n, "files": n, "commit": "<sha>" or null}` |
 | `update <repo> --out <dir>` | Updates the map in `<dir>` for the changes in `<repo>`. Without a map it acts as `build` | same as `build` |
 | `html --out <dir> [--theme dark\|light] [--node-limit n]` | Writes `<dir>/graph.html` from `<dir>/graph.json` | `{"html": "<path>"}` |
-| `serve <dir>/graph.json [--activity <log>]` | Runs the MCP server on stdio. With `--activity`, it tells Kodem when agents read the map (see MCP server) | none |
+| `serve <dir>/graph.json [--activity <log>] [--linked <dir>/graph.json]...` | Runs the MCP server on stdio. With `--activity`, it tells Kodem when agents read the map; with `--linked` (since 0.1.4), it answers from the maps of folders that the project links too (see MCP server) | none |
 | `version` | Prints the versions | `{"version": "<version>", "graphify": "0.9.96", "schema": 1}` |
 
 `<repo>` and `<dir>` are absolute paths. `<dir>` holds `graph.json` directly. A map folder can be copied to another folder and updated against another checkout of the same repository, such as a git worktree.
@@ -51,6 +51,18 @@ Kodem runs `<interpreter> -P -m graphify.kodem_main <command> ...`. `-P` keeps t
 Server name `kodem-codemap`. Tools: `query_graph`, `get_node`, `get_neighbors`, `shortest_path`. The server reloads `graph.json` when the file changes.
 
 With `--activity <log>` (an absolute path; since 0.1.1, a log since 0.1.2), each call of one of the four tools appends one JSON line to `<log>` when it starts and one when it ends: `{"call": "<pid>:<n>", "tool": "<name>", "subject": "<question, symbol, or source → target, at most 160 characters>", "busy": true|false, "at": <wall-clock milliseconds>}`. Before a write, a log larger than 64 KiB moves to `<log>.1`, replacing an older one. A failed write does not fail the call.
+
+### Linked maps
+
+A project can use code outside its repository, such as Unity packages referenced as `file:../../other/Packages/x`. Kodem maps each linked folder on its own and passes its graph with `--linked <dir>/graph.json` (absolute, repeatable; since 0.1.4). The server loads the project's map and adds each linked map (`graphify/kodem_linked.py`):
+
+- The linked map's node identifiers get its folder's name as a prefix (`stratkit:…`), its paths become absolute from its `.graphify_root`, and its communities are numbered after the project's.
+- A name that a map left without a file points at the one definition of that name in another map, when the name's own map has none. Only functions and types count as definitions, never namespaces or fields, and never code in tests, mocks or folders that Unity hides (`Name~`). The moved edges carry `_kodem_linked`.
+- Member calls that the extractors parked on their callers (`metadata.unresolved_calls`) are finished by upstream's cross-repository pass, `link_cross_repo_member_calls`, with every node tagged by its repository.
+- A linked map that is missing or has no `.graphify_root` is left out. The server loads the graphs again when any of them changes.
+- With linked maps, the server answers `initialize` at once and loads the graphs in the background; the first tool call waits for that load.
+
+On s1914-unity with stratkit linked, 9,314 references and 786 member calls cross the two repositories, and the merge takes about 11 seconds and the first call about 19 seconds after the server starts.
 
 ## Changes
 
@@ -63,6 +75,7 @@ With `--activity <log>` (an absolute path; since 0.1.1, a log since 0.1.2), each
 | Kodem MCP mode (`GRAPHIFY_KODEM_MCP=1`): server `kodem-codemap` with instructions that put the map before any file search (since 0.1.2); 4 tools with short schemas and no `project_path` (about 400 tokens instead of 1,600); answers grouped by file with empty fields left out; default depth 2 and budget 1,200; trailing edges cut to the budget. On the Kodem map the average answer fell from about 2,160 to about 1,340 tokens | #4469, #2784 | `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_mcp.py` |
 | Read activity for Kodem: `serve --activity <log>` appends each tool call's start and end with what it asked, so Kodem shows what agents read in a map | none | `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_mcp.py` |
 | Cheaper Kodem sessions (0.1.3): the four tools carry `_meta` `anthropic/alwaysLoad`, so Claude Code loads them with the session instead of behind a tool search turn; `get_neighbors` answers for each place of an ambiguous name, up to three; the server instructions send connection questions to the map and known names to grep | none | `graphify/serve.py`, `tests/test_kodem_mcp.py` |
+| Linked maps (0.1.4): `serve --linked <graph>` answers from the maps of folders that the project links, with names and member calls connected across them. The server instructions start every exploration of code at the map, before grep, find or reading files, and keep grep for text that is not code structure | none | `graphify/kodem_linked.py`, `graphify/serve.py`, `graphify/kodem_main.py`, `tests/test_kodem_linked.py` |
 | Rust calls inside a macro's arguments (`json!({..: f(x)})`, `format!("{}", m::f())`) bind like call expressions; cache schema 29 | none | `graphify/extractors/rust.py`, `graphify/cache.py`, `tests/test_rust_macro_calls.py` |
 | CI for the fork: contract tests on macOS, Windows and Linux, the upstream suite on Linux with the base's known failures deselected; upstream publish, release-graph, welcome and PR-management workflows removed; Dependabot for pinned actions | — | `.github/`, `tests/kodem_known_failures.txt` |
 | Runtime archive build (`scripts/kodem/build_runtime.py`) and the draft-release workflow | — | `scripts/kodem/`, `.github/workflows/runtime.yml` |

@@ -26,9 +26,11 @@ from graphify.paths import default_graph_json as _default_graph_json
 KODEM_SERVER_NAME = "kodem-codemap"
 KODEM_TOOL_NAMES = ("query_graph", "get_node", "get_neighbors", "shortest_path")
 KODEM_INSTRUCTIONS = (
-    "Code Map: a graph of this project's code. Use it for how code connects: get_neighbors "
-    "for what calls or uses a symbol, shortest_path for how two parts connect, query_graph "
-    "for a broader question. Use grep or read for a name, string or file that you know. "
+    "Code Map: a graph of this project's code and of the code it links. Start exploring "
+    "code here, before grep, find or reading files: query_graph or get_node for where "
+    "something is defined or handled, get_neighbors for what calls or uses a symbol, "
+    "shortest_path for how two parts connect. Then read only the lines it names. Use grep "
+    "for text that is not code structure, such as messages, strings and config keys. "
     "In answers, a NODE line without a path is in the file of the NODE line above it."
 )
 _KODEM_DEFAULT_DEPTH = 2
@@ -304,7 +306,7 @@ class _GraphContextCache:
         self._pinned: dict[str, dict] = {}
         self._lock = threading.Lock()
 
-    def _load_entry(self, resolved_path: str, key: tuple[int, int]) -> dict:
+    def _load_entry(self, resolved_path: str, key: tuple, linked: list[str] | None = None) -> dict:
         """Build one entry for an already-resolved path and known file key.
 
         ``_load_graph`` is also used by the CLI, where invalid input terminates
@@ -315,6 +317,11 @@ class _GraphContextCache:
             graph = _load_graph(resolved_path)
         except SystemExit as exc:
             raise RuntimeError(f"could not load graph.json at {resolved_path}") from exc
+        # Kodem: the configured graph serves with the maps of the folders that its project
+        # links (graphify/kodem_linked.py).
+        if linked:
+            from graphify.kodem_linked import merge as _merge_linked
+            graph = _merge_linked(graph, linked, _read_graph)
         # Warm the index before exposing the graph so its first query does not
         # pay the expensive build cost.
         _get_trigram_index(graph)
@@ -341,6 +348,11 @@ class _GraphContextCache:
             except FileNotFoundError:
                 raise FileNotFoundError(f"graph.json not found: {resolved_path}") from None
             key = (stat_result.st_mtime_ns, stat_result.st_size)
+            linked: list[str] = []
+            if pinned:
+                from graphify.kodem_linked import cache_key as _linked_key, linked_graphs
+                linked = linked_graphs()
+                key = (*key, _linked_key(linked))
             entries = self._pinned if pinned else self._entries
             entry = entries.get(resolved_path)
             if entry is not None and entry["key"] == key:
@@ -348,7 +360,7 @@ class _GraphContextCache:
                     self._entries.move_to_end(resolved_path)
                 return entry["G"], entry["communities"]
 
-            entry = self._load_entry(resolved_path, key)
+            entry = self._load_entry(resolved_path, key, linked)
             entries[resolved_path] = entry
             if not pinned:
                 self._entries.move_to_end(resolved_path)
@@ -2472,8 +2484,18 @@ def _build_server(graph_path: str):
     # await between them), so a concurrent call never observes a half-applied
     # swap.
     active_graph_path = _default_graph_path
+    from graphify.kodem_linked import linked_graphs as _linked_graphs
     try:
-        G, communities = _load_ctx(_default_graph_path)
+        if kodem_mode() and _linked_graphs():
+            # Kodem: merging linked maps can take longer than a client waits for the server to
+            # start, so the server answers at once and loads in the background. The first call
+            # waits for that load in _select_graph.
+            G, communities = None, {}
+            threading.Thread(
+                target=lambda: _load_ctx(_default_graph_path), daemon=True,
+            ).start()
+        else:
+            G, communities = _load_ctx(_default_graph_path)
     except (FileNotFoundError, RuntimeError):
         # No default graph at startup → run as a pure multi-project server. Tools
         # then require project_path; a call without one gets a clear error rather
